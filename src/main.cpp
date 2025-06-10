@@ -17,7 +17,7 @@ struct ArgList {
     std::string mode = "train";
     bool resume = false;
     double lr = 1e-3;                 // Increased learning rate
-    int episodes = 100;
+    int episodes = 1000;
     int update_every = 20;           // More frequent updates
     double gamma = 0.99;
     double gae_lambda = 0.95;
@@ -27,7 +27,7 @@ struct ArgList {
     double ppo_clip_term = 0.2;
     double entropy_weightage = 0.01; // Promote exploration
     double gradient_clip_term = 0.5;
-    int eval_every = 250;            // Evaluate more often
+    int eval_every = 50;            // Evaluate more often
     int eval_over = 3;
 };
 
@@ -75,10 +75,11 @@ public:
     static constexpr int kGridSize_v = 25;
     static constexpr int kObsSize = 4;       // agent_x, agent_y, target_x, target_y
     static constexpr int kNumActions = 2;    // up, down, left, right
+    static constexpr int kMaxSteps = 100;
     int min_dist = 60;
 
     TimeStep& reset() {
-
+        step_count = 0;
         do {
             agent_x = dist_x(gen);
             agent_y = dist_y(gen);
@@ -101,6 +102,7 @@ public:
     }
 
     TimeStep& step(torch::Tensor actions) {
+        step_count++;
         // Convert actions to CPU and float
         auto acts = actions.to(torch::kCPU).to(torch::kFloat32).squeeze();
 
@@ -132,16 +134,21 @@ public:
         float reward = 0.0f;
 
         if (out_of_bounds) {
-            reward = -1.0f;
+            reward -= 1.0f;
             time_step.done = true;
         }
         else if (new_dist <= 1.0f) {
-            reward = 1.0f;
+            reward += 1.0f;
+            time_step.done = true;
+        }
+        else if (step_count >= kMaxSteps) {   // Check max steps reached
+            reward -= 1.0f;
+            step_count = 0;
             time_step.done = true;
         }
         else {
             reward = (new_dist < prev_dist) ? 0.01f : -0.01f;
-            reward += (1.0f / new_dist); // Add inverse distance reward
+            //reward += (1.0f / new_dist); // Add inverse distance reward
             time_step.done = false;
         }
 
@@ -209,7 +216,7 @@ public:
 private:
     int agent_x = 0, agent_y = 0;
     int target_x = 0, target_y = 0;
-
+    int step_count = 0;
     std::random_device rd;
     std::mt19937 gen;
     std::uniform_int_distribution<> dist_x;
@@ -362,8 +369,6 @@ struct CriticNetworkImpl : torch::nn::Module {
     }
 };
 TORCH_MODULE(CriticNetwork);
-
-
 
 class PPO {
 public:
@@ -537,7 +542,7 @@ public:
     void log_training_metrics(const std::string& key, double value = 0.0) {
         static std::unordered_map<std::string, std::vector<double>> metric_log;
         static bool header_printed = false;
-
+        return;
         const std::vector<std::pair<std::string, std::string>> metrics = {
             {"episode",       "Episode"},
             {"reward",        "Reward (↑)"},
@@ -680,7 +685,9 @@ public:
                             actor_optimizer->step();
                             critic_optimizer->step();
                         }
-                        catch (const c10::Error& e) {}
+                        catch (const c10::Error& e) {
+                            std::cerr << "Backward pass error: " << e.what() << "\n";
+                        }
                     }
                     if (batch_count > 0) {
                         log_training_metrics("actor_loss", actor_loss_sum / batch_count);
@@ -695,14 +702,14 @@ public:
             auto rollout = collect_rollout(obs);
             auto [obs_tensor, act_tensor, old_log_tensor, val_tensor, ret_tensor, adv_tensor] = compute_returns_and_advantages(rollout);
             run_ppo_update(obs_tensor, act_tensor, old_log_tensor, val_tensor, ret_tensor, adv_tensor, episode_index);
-            if (rollout.done) {
+            //if (rollout.done) 
+            {
                 log_training_metrics("episode", episode_index);
                 log_training_metrics("reward", rollout.total_reward);
                 logger.add_scalar("episode_reward", rollout.total_reward, episode_index);
                 if (episode_index % arglist.eval_every == 0 || episode_index == arglist.episodes - 1) {
-                    auto eval_rewards = eval(arglist.eval_over, true, true);
+                    auto eval_rewards = eval(arglist.eval_over, true, false);
                     double mean = std::accumulate(eval_rewards.begin(), eval_rewards.end(), 0.0) / eval_rewards.size();
-                    log_training_metrics("eval_reward", mean);
                     logger.add_scalar("evaluation_reward", mean, episode_index);
                     save_checkpoint(std::to_string(episode_index) + ".ckpt");
                 }
@@ -778,7 +785,6 @@ public:
                 if (done) {
                     ep_r_list.push_back(ep_r);
                     if (render) {
-                        std::cout << "Episode finished with total reward " << ep_r << std::endl;
                         //matplotlibcpp::pause(0.5);
                     }
                     break;
@@ -822,7 +828,7 @@ private:
 };
 
 int main() {
-
+    system("mode con: cols=200");
     std::cout << "LibTorch version: " << TORCH_VERSION << std::endl;
 
     if (torch::cuda::is_available()) {
