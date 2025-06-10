@@ -10,7 +10,6 @@
 #include <string>
 #include <tuple>
 
-
 struct ArgList {
     int seed = 0;
     std::string domain = "";
@@ -62,40 +61,6 @@ public:
     }
 };
 
-void write_rgb_pattern_mp4() {
-    const int width = 640;
-    const int height = 480;
-    const int frames = 30;
-    std::vector<uint8_t> frame(width * height * 3);
-
-    // Create a horizontal RGB gradient pattern
-    for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            int idx = (y * width + x) * 3;
-            frame[idx + 0] = static_cast<uint8_t>((x * 255) / width);  // R
-            frame[idx + 1] = static_cast<uint8_t>((y * 255) / height); // G
-            frame[idx + 2] = static_cast<uint8_t>(255 - (x * 255) / width); // B
-        }
-    }
-
-    std::string command = "ffmpeg -y -f rawvideo -pix_fmt rgb24 -s 640x480 -r 30 "
-        "-i - -an -vcodec libx264 -pix_fmt yuv420p test.mp4";
-
-    FILE* pipe = _popen(command.c_str(), "wb");
-    if (!pipe) {
-        std::cerr << "Failed to open ffmpeg pipe." << std::endl;
-        return;
-    }
-
-    for (int i = 0; i < frames; ++i) {
-        fwrite(frame.data(), 1, frame.size(), pipe);
-    }
-
-    fflush(pipe);
-    _pclose(pipe);
-}
-
-
 struct TimeStep {
     std::map<std::string, torch::Tensor> observation;
     double reward;
@@ -104,7 +69,6 @@ struct TimeStep {
     bool last() const { return last_flag; }
 };
 
-//The environment
 class GridWorldEnv {
 public:
     static constexpr int kGridSize_h = 80;
@@ -254,46 +218,6 @@ private:
     TimeStep time_step;
 };
 
-class LossTracker {
-private:
-    std::vector<float> actor_losses;
-    std::vector<float> critic_losses;
-    int graph_width = 50;
-
-    void print_graph(const std::vector<float>& losses, const std::string& name) {
-        if (losses.empty()) return;
-
-        float max_loss = *std::max_element(losses.begin(), losses.end());
-        float min_loss = *std::min_element(losses.begin(), losses.end());
-
-        std::cout << name << " loss graph:\n";
-
-        for (float loss : losses) {
-            int bar_len = (int)((loss - min_loss) / (max_loss - min_loss + 1e-8) * graph_width);
-            std::cout << "|";
-            for (int i = 0; i < bar_len; i++) std::cout << "=";
-            std::cout << " " << loss << "\n";
-        }
-        std::cout << std::endl;
-    }
-
-public:
-    void add_losses(float actor_loss, float critic_loss) {
-        actor_losses.push_back(actor_loss);
-        critic_losses.push_back(critic_loss);
-    }
-
-    void print_all() {
-        print_graph(actor_losses, "Actor");
-        print_graph(critic_losses, "Critic");
-    }
-
-    void clear() {
-        actor_losses.clear();
-        critic_losses.clear();
-    }
-};
-
 struct NormalDistribution {
     torch::Tensor mean;
     torch::Tensor sigma; //Standard deviation
@@ -439,17 +363,6 @@ struct CriticNetworkImpl : torch::nn::Module {
 };
 TORCH_MODULE(CriticNetwork);
 
-// Parses the observation dictionary from the TimeStep
-std::tuple<torch::Tensor, double, bool> process_observation(const TimeStep& time_step) {
-    std::vector<torch::Tensor> obs_tensors;
-    for (const auto& [_, val] : time_step.observation) {
-        obs_tensors.push_back(val.unsqueeze(0).to(torch::kFloat32));
-    }
-    torch::Tensor obs = torch::cat(obs_tensors, 0);
-    double r = time_step.reward;
-    bool done = time_step.done;
-    return { obs, r, done };
-}
 
 
 class PPO {
@@ -531,6 +444,17 @@ public:
         }
     }
 
+    std::tuple<torch::Tensor, double, bool> process_observation(const TimeStep& time_step) {
+        std::vector<torch::Tensor> obs_tensors;
+        for (const auto& [_, val] : time_step.observation) {
+            obs_tensors.push_back(val.unsqueeze(0).to(torch::kFloat32));
+        }
+        torch::Tensor obs = torch::cat(obs_tensors, 0);
+        double r = time_step.reward;
+        bool done = time_step.done;
+        return { obs, r, done };
+    }
+
     torch::Tensor normalize_observation(const torch::Tensor& o, bool update = false) {
         static torch::Tensor running_mean = torch::zeros_like(o);
         static torch::Tensor running_var = torch::ones_like(o);
@@ -561,7 +485,6 @@ public:
         return torch::clamp(norm_obs, -10.0, 10.0);
     }
 
-    // Save checkpoint function
     void save_checkpoint(const std::string& name) {
         try {
             torch::serialize::OutputArchive archive;
@@ -668,7 +591,6 @@ public:
             auto ret_tensor = torch::stack(returns);
             auto adv_tensor = (ret_tensor - value_tensor).detach();
 
-            // Print advantage stats early
             std::cout << "Advantage mean: " << adv_tensor.mean().item<double>()
                 << ", std: " << adv_tensor.std().item<double>() << std::endl;
 
@@ -861,7 +783,6 @@ private:
     std::unique_ptr<torch::optim::Adam> actor_optimizer;
     std::unique_ptr<torch::optim::Adam> critic_optimizer;
     ObsStats obs_stats;
-    LossTracker loss_tracker;
 
     int frame_width = 640;
     int frame_height = 480;
@@ -871,8 +792,6 @@ private:
 };
 
 int main() {
-
-    write_rgb_pattern_mp4();
 
     std::cout << "LibTorch version: " << TORCH_VERSION << std::endl;
 
