@@ -534,6 +534,46 @@ public:
         }
     }
 
+    void log_training_metrics(const std::string& key, double value = 0.0) {
+        static std::unordered_map<std::string, std::vector<double>> metric_log;
+        static bool header_printed = false;
+
+        const std::vector<std::pair<std::string, std::string>> metrics = {
+            {"episode",       "Episode"},
+            {"reward",        "Reward (↑)"},
+            {"eval_reward",   "EvalReward (↑ stable)"},
+            {"adv_mean",      "AdvMean (~0)"},
+            {"adv_std",       "AdvStd (!=0)"},
+            {"ratio_mean",    "RatioMean (~1)"},
+            {"ratio_std",     "RatioStd (<0.2)"},
+            {"actor_loss",    "ActorLoss (↓)"},
+            {"critic_loss",   "CriticLoss (↓)"}
+        };
+
+        if (key == "draw") {
+            if (!header_printed) {
+                for (const auto& [k, label] : metrics)
+                    std::cout << std::setw(14) << label << "\t\t";
+                std::cout << '\n';
+                header_printed = true;
+            }
+
+            for (const auto& [k, _] : metrics) {
+                const auto& vec = metric_log[k];
+                if (!vec.empty()) {
+                    std::cout << std::setw(14) << vec.back() << "\t\t";
+                }
+                else {
+                    std::cout << std::setw(14) << "N/A" << "\t\t";
+                }
+            }
+            std::cout << '\n';
+        }
+        else {
+            metric_log[key].push_back(value);
+        }
+    }
+
     void train_simplified() {
         SimpleTensorBoardLogger logger("runs/log_dir");
 
@@ -590,10 +630,8 @@ public:
             auto value_tensor = torch::stack(data.state_values).slice(0, 0, returns.size());
             auto ret_tensor = torch::stack(returns);
             auto adv_tensor = (ret_tensor - value_tensor).detach();
-
-            std::cout << "Advantage mean: " << adv_tensor.mean().item<double>()
-                << ", std: " << adv_tensor.std().item<double>() << std::endl;
-
+            log_training_metrics("adv_mean", adv_tensor.mean().item<double>());
+            log_training_metrics("adv_std", adv_tensor.std(false).item<double>());
             return std::make_tuple(obs_tensor, act_tensor, old_log_tensor, value_tensor, ret_tensor, adv_tensor);
             };
 
@@ -618,21 +656,15 @@ public:
                         auto log_probs = dist.log_prob(b_act).sum(1);
                         auto ratio = torch::exp(log_probs - b_old_log);
 
-                        // Print policy ratio stats before clipping
-                        std::cout << "Ratio mean: " << ratio.mean().item<double>()
-                            << ", std: " << ratio.std().item<double>() << std::endl;
+                        log_training_metrics("ratio_mean", ratio.mean().item<double>());
+                        log_training_metrics("ratio_std", ratio.std(false).item<double>());
 
                         auto surr1 = ratio * b_adv;
                         auto surr2 = torch::clamp(ratio, 1 - arglist.ppo_clip_term, 1 + arglist.ppo_clip_term) * b_adv;
                         auto actor_loss = -torch::min(surr1, surr2).mean();
                         auto critic_loss = 0.5 * torch::mse_loss(val_est, b_ret);
 
-                        // Print losses per batch
-                        std::cout << "Actor loss: " << actor_loss.item<double>()
-                            << ", Critic loss: " << critic_loss.item<double>() << std::endl;
-
                         if (actor_loss.isnan().item<bool>() || critic_loss.isnan().item<bool>()) {
-                            std::cerr << "NaN detected in losses. Skipping batch update.\n";
                             break;
                         }
                         actor_loss_sum += actor_loss.item<double>();
@@ -648,14 +680,11 @@ public:
                             actor_optimizer->step();
                             critic_optimizer->step();
                         }
-                        catch (const c10::Error& e) {
-                            std::cerr << "Backward pass error: " << e.what() << "\n";
-                        }
+                        catch (const c10::Error& e) {}
                     }
                     if (batch_count > 0) {
-                        std::cout << "Episode " << episode_index << " Epoch " << epoch
-                            << " Actor Loss: " << actor_loss_sum / batch_count
-                            << " Critic Loss: " << critic_loss_sum / batch_count << std::endl;
+                        log_training_metrics("actor_loss", actor_loss_sum / batch_count);
+                        log_training_metrics("critic_loss", critic_loss_sum / batch_count);
                     }
                 }
             };
@@ -667,22 +696,23 @@ public:
             auto [obs_tensor, act_tensor, old_log_tensor, val_tensor, ret_tensor, adv_tensor] = compute_returns_and_advantages(rollout);
             run_ppo_update(obs_tensor, act_tensor, old_log_tensor, val_tensor, ret_tensor, adv_tensor, episode_index);
             if (rollout.done) {
-                std::cout << "Episode " << episode_index << " average reward: " << rollout.total_reward << std::endl;
+                log_training_metrics("episode", episode_index);
+                log_training_metrics("reward", rollout.total_reward);
                 logger.add_scalar("episode_reward", rollout.total_reward, episode_index);
                 if (episode_index % arglist.eval_every == 0 || episode_index == arglist.episodes - 1) {
                     auto eval_rewards = eval(arglist.eval_over, true, true);
                     double mean = std::accumulate(eval_rewards.begin(), eval_rewards.end(), 0.0) / eval_rewards.size();
+                    log_training_metrics("eval_reward", mean);
                     logger.add_scalar("evaluation_reward", mean, episode_index);
                     save_checkpoint(std::to_string(episode_index) + ".ckpt");
                 }
+                log_training_metrics("draw");
                 if ((episode_index % 250 == 0 || episode_index == arglist.episodes - 1) && episode_index > start_episode) {
                     save_backup(episode_index);
                 }
             }
         }
     }
-
-
 
     std::vector<double> eval(int episodes, bool render = false, bool save_video = false) {
         int t = 0;
