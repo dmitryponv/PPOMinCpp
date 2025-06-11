@@ -15,20 +15,20 @@
 using namespace std;
 
 void print_tensor_inline(const std::string& name, const torch::Tensor& t, int precision = 4, int max_elements = 10) {
-    torch::Tensor flat = t.flatten().cpu();
-    std::cout << name << "=tensor([";
-    int64_t size = flat.size(0);
-    std::cout << std::fixed << std::setprecision(precision);
-    for (int64_t i = 0; i < std::min<int64_t>(size, max_elements / 2); ++i) {
-        std::cout << flat[i].item<double>() << ", ";
-    }
-    if (size > max_elements) {
-        std::cout << "...";
-        for (int64_t i = size - max_elements / 2; i < size; ++i) {
-            std::cout << ", " << flat[i].item<double>();
-        }
-    }
-    std::cout << "])" << std::endl << std::endl;
+    //torch::Tensor flat = t.flatten().cpu();
+    //std::cout << name << "=tensor([";
+    //int64_t size = flat.size(0);
+    //std::cout << std::fixed << std::setprecision(precision);
+    //for (int64_t i = 0; i < std::min<int64_t>(size, max_elements / 2); ++i) {
+    //    std::cout << flat[i].item<double>() << ", ";
+    //}
+    //if (size > max_elements) {
+    //    std::cout << "...";
+    //    for (int64_t i = size - max_elements / 2; i < size; ++i) {
+    //        std::cout << ", " << flat[i].item<double>();
+    //    }
+    //}
+    //std::cout << "])" << std::endl << std::endl;
 }
 
 // Abstract environment interface
@@ -321,6 +321,145 @@ private:
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
 
+class MultivariateNormal {
+public:
+    torch::Tensor loc;
+    torch::Tensor _unbroadcasted_scale_tril;
+    torch::Tensor scale_tril_;
+    torch::Tensor covariance_matrix_;
+    torch::Tensor precision_matrix_;
+    std::vector<int64_t> batch_shape;
+    std::vector<int64_t> event_shape;
+
+    MultivariateNormal(const torch::Tensor& loc,
+        const torch::optional<torch::Tensor>& covariance_matrix = torch::nullopt,
+        const torch::optional<torch::Tensor>& precision_matrix = torch::nullopt,
+        const torch::optional<torch::Tensor>& scale_tril = torch::nullopt) {
+        if (loc.dim() < 1) {
+            throw std::invalid_argument("loc must be at least one-dimensional.");
+        }
+
+        int specified = (bool)covariance_matrix + (bool)precision_matrix + (bool)scale_tril;
+        if (specified != 1) {
+            throw std::invalid_argument("Exactly one of covariance_matrix, precision_matrix, or scale_tril must be specified.");
+        }
+
+        if (scale_tril.has_value()) {
+            if (scale_tril->dim() < 2) {
+                throw std::invalid_argument("scale_tril must be at least two-dimensional.");
+            }
+            auto bshape = broadcast_shapes(scale_tril->sizes().vec(), loc.sizes().vec(), 2, 1);
+            scale_tril_ = scale_tril->expand(bshape).contiguous();
+            _unbroadcasted_scale_tril = *scale_tril;
+            batch_shape = std::vector<int64_t>(bshape.begin(), bshape.end() - 2);
+        }
+        else if (covariance_matrix.has_value()) {
+            if (covariance_matrix->dim() < 2) {
+                throw std::invalid_argument("covariance_matrix must be at least two-dimensional.");
+            }
+            auto bshape = broadcast_shapes(covariance_matrix->sizes().vec(), loc.sizes().vec(), 2, 1);
+            covariance_matrix_ = covariance_matrix->expand(bshape).contiguous();
+            _unbroadcasted_scale_tril = torch::linalg_cholesky(*covariance_matrix);
+            batch_shape = std::vector<int64_t>(bshape.begin(), bshape.end() - 2);
+        }
+        else {
+            if (precision_matrix->dim() < 2) {
+                throw std::invalid_argument("precision_matrix must be at least two-dimensional.");
+            }
+            auto bshape = broadcast_shapes(precision_matrix->sizes().vec(), loc.sizes().vec(), 2, 1);
+            precision_matrix_ = precision_matrix->expand(bshape).contiguous();
+            _unbroadcasted_scale_tril = torch::linalg_cholesky(torch::linalg_inv(*precision_matrix));
+            batch_shape = std::vector<int64_t>(bshape.begin(), bshape.end() - 2);
+        }
+
+        auto expanded_shape = batch_shape;
+        expanded_shape.push_back(loc.size(-1));
+        this->loc = loc.expand(expanded_shape).contiguous();
+        event_shape = { loc.size(-1) };
+    }
+
+    torch::Tensor scale_tril() const {
+        auto shape = batch_shape;
+        shape.insert(shape.end(), event_shape.begin(), event_shape.end());
+        shape.insert(shape.end(), event_shape.begin(), event_shape.end());
+        return _unbroadcasted_scale_tril.expand(shape);
+    }
+
+    torch::Tensor covariance_matrix() const {
+        auto L = _unbroadcasted_scale_tril;
+        auto shape = batch_shape;
+        shape.insert(shape.end(), event_shape.begin(), event_shape.end());
+        shape.insert(shape.end(), event_shape.begin(), event_shape.end());
+        return torch::matmul(L, L.transpose(-2, -1)).expand(shape);
+    }
+
+    torch::Tensor precision_matrix() const {
+        auto shape = batch_shape;
+        shape.insert(shape.end(), event_shape.begin(), event_shape.end());
+        shape.insert(shape.end(), event_shape.begin(), event_shape.end());
+        return torch::cholesky_inverse(_unbroadcasted_scale_tril).expand(shape);
+    }
+
+    torch::Tensor mean() const {
+        return loc;
+    }
+
+    torch::Tensor mode() const {
+        return loc;
+    }
+
+    torch::Tensor variance() const {
+        auto shape = batch_shape;
+        shape.insert(shape.end(), event_shape.begin(), event_shape.end());
+        return _unbroadcasted_scale_tril.pow(2).sum(-1).expand(shape);
+    }
+
+    torch::Tensor sample(const std::vector<int64_t>& sample_shape = {}) const {
+        torch::NoGradGuard no_grad;
+        auto shape = sample_shape;
+        shape.insert(shape.end(), loc.sizes().begin(), loc.sizes().end());
+        auto eps = torch::randn(shape, loc.options());
+        auto L = _unbroadcasted_scale_tril;
+        auto result = loc + torch::matmul(L, eps.unsqueeze(-1)).squeeze(-1);
+        return result;
+    }
+
+    torch::Tensor log_prob(const torch::Tensor& value) const {
+        auto diff = value - loc;
+        auto M = batch_mahalanobis(_unbroadcasted_scale_tril, diff);
+        auto half_log_det = _unbroadcasted_scale_tril.diagonal(0, -2, -1).log().sum(-1);
+        return -0.5 * (event_shape[0] * std::log(2 * M_PI) + M) - half_log_det;
+    }
+
+    torch::Tensor entropy() const {
+        auto half_log_det = _unbroadcasted_scale_tril.diagonal(0, -2, -1).log().sum(-1);
+        return 0.5 * event_shape[0] * (1.0 + std::log(2 * M_PI)) + half_log_det;
+    }
+
+private:
+    static torch::Tensor batch_mahalanobis(const torch::Tensor& L, const torch::Tensor& diff) {
+        auto solve = torch::linalg_solve_triangular(L, diff.unsqueeze(-1), /*upper=*/false).squeeze(-1);
+        return solve.pow(2).sum(-1);
+    }
+
+    static std::vector<int64_t> broadcast_shapes(std::vector<int64_t> a, std::vector<int64_t> b, int a_end = 0, int b_end = 0) {
+        auto a_prefix = std::vector<int64_t>(a.begin(), a.end() - a_end);
+        auto b_prefix = std::vector<int64_t>(b.begin(), b.end() - b_end);
+        size_t ndim = std::max(a_prefix.size(), b_prefix.size());
+        std::vector<int64_t> result(ndim, 1);
+        for (int i = ndim - 1, ai = a_prefix.size() - 1, bi = b_prefix.size() - 1; i >= 0; --i, --ai, --bi) {
+            int64_t a_dim = ai >= 0 ? a_prefix[ai] : 1;
+            int64_t b_dim = bi >= 0 ? b_prefix[bi] : 1;
+            if (a_dim != b_dim && a_dim != 1 && b_dim != 1) {
+                throw std::invalid_argument("Incompatible shapes for broadcasting");
+            }
+            result[i] = std::max(a_dim, b_dim);
+        }
+        result.insert(result.end(), a.end() - a_end, a.end());
+        return result;
+    }
+};
+
 struct FeedForwardNNImpl : torch::nn::Module {
     torch::nn::Linear layer1{ nullptr }, layer2{ nullptr }, layer3{ nullptr };
 
@@ -370,37 +509,6 @@ public:
         logger["t_so_far"] = 0;
         logger["i_so_far"] = 0;
     }
-
-    struct MultivariateNormal {
-        torch::Tensor mean, cov, chol, inv_cov;
-        float log_det;
-
-        MultivariateNormal(const torch::Tensor& mean_, const torch::Tensor& cov_)
-            : mean(mean_), cov(cov_) {
-            chol = torch::linalg_cholesky(cov);
-            inv_cov = torch::linalg_inv(cov);
-            log_det = torch::logdet(cov).item<float>();
-        }
-
-        torch::Tensor sample() const {
-            auto eps = torch::randn_like(mean);
-            return mean + torch::matmul(chol, eps);
-        }
-
-        torch::Tensor log_prob(const torch::Tensor& x) const {
-            try {
-                auto diff = (x - mean).unsqueeze(-1);
-                // Ensure dimensions are correct before matmul
-                auto diff_transposed = diff.transpose(-2, -1);  // transpose last two dims
-                auto exponent = -0.5 * torch::matmul(diff_transposed, torch::matmul(inv_cov, diff)).squeeze();
-                return exponent - 0.5 * mean.size(0) * std::log(2 * M_PI) - 0.5 * log_det;
-            }
-            catch (const std::exception& e) {
-                std::cerr << "Exception in log_prob: " << e.what() << std::endl;
-                throw;
-            }
-        }
-    };
 
     void learn(int total_timesteps) {
         cout << "Learning... Running " << max_timesteps_per_episode
@@ -495,7 +603,7 @@ public:
     tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rollout() {
         // Batch data. For more details, check function header.
         vector<torch::Tensor> batch_obs_vec;
-        vector<vector<float>> batch_acts_vec;
+        vector<torch::Tensor> batch_acts_vec;
         vector<torch::Tensor> batch_log_probs_vec;
         vector<vector<float>> batch_rewards;
         vector<int> batch_lengths_vec;
@@ -531,6 +639,7 @@ public:
                 // Calculate action and make a step in the env.
                 // Note that rew is short for reward.
                 auto [action, log_prob] = get_action(obs_tensor);
+                torch::Tensor action_tensor = torch::from_blob((void*)action.data(), { (int)action.size() }, torch::kFloat).clone();
                 auto [next_obs, rew, terminated, truncated, __] = env.step(action);
                 print_tensor_inline("log_prob", log_prob);
 
@@ -539,7 +648,7 @@ public:
 
                 // Track recent reward, action, and action log probability
                 ep_rews.push_back(rew);
-                batch_acts_vec.push_back(action);
+                batch_acts_vec.push_back(action_tensor);
                 batch_log_probs_vec.push_back(log_prob);
 
                 obs = next_obs;
@@ -557,8 +666,8 @@ public:
 
         // Reshape data as tensors in the shape specified in function description, before returning
         torch::Tensor batch_obs = torch::stack(batch_obs_vec).to(torch::kFloat);
-        torch::Tensor batch_acts = torch::from_blob(batch_acts_vec.data(), { (int)batch_acts_vec.size(), (int)batch_acts_vec[0].size() }, torch::kFloat).clone();
-        torch::Tensor batch_log_probs = torch::from_blob(batch_log_probs_vec.data(), { (int)batch_log_probs_vec.size() }, torch::kFloat).clone();
+        torch::Tensor batch_acts = torch::stack(batch_acts_vec).to(torch::kFloat);
+        torch::Tensor batch_log_probs = torch::stack(batch_log_probs_vec).to(torch::kFloat);
         torch::Tensor batch_rtgs = compute_rtgs(batch_rewards); // ALG STEP 4
         torch::Tensor batch_lengths = torch::tensor(batch_lengths_vec, torch::kInt64);
 
@@ -627,9 +736,8 @@ public:
 
         // Detach before returning
         vector<float> action(action_tensor.detach().data_ptr<float>(), action_tensor.detach().data_ptr<float>() + action_tensor.numel());
-        torch::Tensor log_prob_detached = log_prob_tensor.detach();
 
-        return { action, log_prob_detached };
+        return { action, log_prob_tensor.detach() };
     }
 
     pair<torch::Tensor, torch::Tensor> evaluate(const torch::Tensor& batch_obs, const torch::Tensor& batch_acts) {
@@ -924,7 +1032,7 @@ int main(int argc, char* argv[]) {
 
 
     try {
-        PendulumEnv env;
+        AgentTargetEnv env;
         if (true) {
             train(env, hyperparameters, "", "");
         }

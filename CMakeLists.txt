@@ -13,9 +13,9 @@ set(CAFFE2_USE_CUFILE 1)
 ################## TORCH DIR ################
 #############################################
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-    set(Torch_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libtorch_d/share/cmake/Torch")
+    set(Torch_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libtorch_r/share/cmake/Torch")
 else()
-    set(Torch_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libtorch_d/share/cmake/Torch")
+    set(Torch_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libtorch_r/share/cmake/Torch")
 endif()
 
 # Torch
@@ -33,9 +33,9 @@ set_property(TARGET PPOmin PROPERTY CXX_STANDARD 17)
 ############ COPY ONLY DLL FILES ############
 #############################################
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-    set(LIBTORCH_DLL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libtorch_d/lib")
+    set(LIBTORCH_DLL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libtorch_r/lib")
 else()
-    set(LIBTORCH_DLL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libtorch_d/lib")
+    set(LIBTORCH_DLL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libtorch_r/lib")
 endif()
 
 file(GLOB TORCH_DLLS "${LIBTORCH_DLL_DIR}/*.dll")
