@@ -9,855 +9,703 @@
 #include <cmath>
 #include <string>
 #include <tuple>
+#include <chrono>
+#include <unordered_map>
 
-struct ArgList {
-    int seed = 0;
-    std::string domain = "";
-    std::string task = "";
-    std::string mode = "train";
-    bool resume = false;
-    double lr = 1e-3;                 // Increased learning rate
-    int episodes = 1000;
-    int update_every = 20;           // More frequent updates
-    double gamma = 0.99;
-    double gae_lambda = 0.95;
-    int epochs = 5;                  // Fewer epochs per update
-    int batch_size = 128;            // Larger batches
-    double target_kl = 0.01;
-    double ppo_clip_term = 0.2;
-    double entropy_weightage = 0.01; // Promote exploration
-    double gradient_clip_term = 0.5;
-    int eval_every = 50;            // Evaluate more often
-    int eval_over = 3;
+using namespace std;
+
+// Abstract environment interface
+class Env {
+public:
+    struct Space {
+        vector<int> shape;
+    };
+
+    virtual ~Env() = default;
+
+    // Reset the environment and return initial observation
+    virtual pair<vector<float>, unordered_map<string, float>> reset() = 0;
+
+    // Step the environment with given action
+    // Returns: observation, reward, terminated flag, truncated flag, extra info
+    virtual tuple<vector<float>, float, bool, bool, unordered_map<string, float>> step(const vector<float>& action) = 0;
+
+    virtual void render() = 0;
+
+    virtual Space observation_space() const = 0;
+
+    virtual Space action_space() const = 0;
 };
 
-class FFmpegWriter {
-    FILE* pipe;
-    std::string command;
-    int w, h;
-
+class GymEnv : public Env {
 public:
-    FFmpegWriter(const std::string& filename, int width, int height, int fps)
-        : w(width), h(height)
+    GymEnv(const string& env_name, const string& render_mode)
+        : env_name(env_name), render_mode(render_mode)
     {
-        command = "ffmpeg -y -f rawvideo -vcodec rawvideo -pix_fmt rgb24 "
-            "-s " + std::to_string(w) + "x" + std::to_string(h) +
-            " -r " + std::to_string(fps) +
-            " -i - -an -vcodec libx264 -pix_fmt yuv420p \"" + filename + "\"";
-
-        pipe = _popen(command.c_str(), "wb");
-        if (!pipe) throw std::runtime_error("Failed to open FFmpeg pipe.");
-    }
-
-    void write_frame(const void* data) {
-        fwrite(data, 1, 3 * w * h, pipe);
-    }
-
-    int width() const { return w; }
-    int height() const { return h; }
-
-    ~FFmpegWriter() {
-        if (pipe) _pclose(pipe);
-    }
-};
-
-struct TimeStep {
-    std::map<std::string, torch::Tensor> observation;
-    double reward;
-    bool last_flag;
-    bool done;
-    bool last() const { return last_flag; }
-};
-
-class GridWorldEnv {
-public:
-    static constexpr int kGridSize_h = 80;
-    static constexpr int kGridSize_v = 25;
-    static constexpr int kObsSize = 4;       // agent_x, agent_y, target_x, target_y
-    static constexpr int kNumActions = 2;    // up, down, left, right
-    static constexpr int kMaxSteps = 100;
-    int min_dist = 60;
-
-    TimeStep& reset() {
-        step_count = 0;
-        do {
-            agent_x = dist_x(gen);
-            agent_y = dist_y(gen);
-            target_x = dist_x(gen);
-            target_y = dist_y(gen);
-        } while ((agent_x == target_x && agent_y == target_y) ||
-            ((agent_x - target_x) * (agent_x - target_x) +
-                (agent_y - target_y) * (agent_y - target_y)) < min_dist);
-
-        time_step.observation["agent_x"] = torch::tensor(agent_x, torch::kInt32);
-        time_step.observation["agent_y"] = torch::tensor(agent_y, torch::kInt32);
-        time_step.observation["target_x"] = torch::tensor(target_x, torch::kInt32);
-        time_step.observation["target_y"] = torch::tensor(target_y, torch::kInt32);
-
-        time_step.reward = 0.0;
-        time_step.done = false;
-        time_step.last_flag = false;
-
-        return time_step;
-    }
-
-    TimeStep& step(torch::Tensor actions) {
-        step_count++;
-        // Convert actions to CPU and float
-        auto acts = actions.to(torch::kCPU).to(torch::kFloat32).squeeze();
-
-        float agent_dx = acts[0].item<float>();
-        float agent_dy = acts[1].item<float>();
-
-        int prev_agent_x = agent_x;
-        int prev_agent_y = agent_y;
-
-        float prev_dist = std::hypot(agent_x - target_x, agent_y - target_y);
-
-        int new_agent_x = agent_x + static_cast<int>(std::round(agent_dx));
-        int new_agent_y = agent_y + static_cast<int>(std::round(agent_dy));
-
-        bool out_of_bounds =
-            new_agent_x < 0 || new_agent_x >= kGridSize_h ||
-            new_agent_y < 0 || new_agent_y >= kGridSize_v;
-
-        agent_x = std::clamp(new_agent_x, 0, kGridSize_h - 1);
-        agent_y = std::clamp(new_agent_y, 0, kGridSize_v - 1);
-
-        float new_dist = std::hypot(agent_x - target_x, agent_y - target_y);
-
-        time_step.observation["agent_x"] = torch::tensor(agent_x, torch::kInt32);
-        time_step.observation["agent_y"] = torch::tensor(agent_y, torch::kInt32);
-        time_step.observation["target_x"] = torch::tensor(target_x, torch::kInt32);
-        time_step.observation["target_y"] = torch::tensor(target_y, torch::kInt32);
-
-        float reward = 0.0f;
-
-        if (out_of_bounds) {
-            reward -= 1.0f;
-            time_step.done = true;
-        }
-        else if (new_dist <= 1.0f) {
-            reward += 1.0f;
-            time_step.done = true;
-        }
-        else if (step_count >= kMaxSteps) {   // Check max steps reached
-            reward -= 1.0f;
-            step_count = 0;
-            time_step.done = true;
+        if (env_name == "Pendulum-v1") {
+            obs_space.shape = { 3 };  // [cos(theta), sin(theta), theta_dot]
+            act_space.shape = { 1 };  // torque
+            reset();
         }
         else {
-            reward = (new_dist < prev_dist) ? 0.01f : -0.01f;
-            //reward += (1.0f / new_dist); // Add inverse distance reward
-            time_step.done = false;
+            throw runtime_error("Unsupported environment: " + env_name);
         }
-
-        time_step.reward = reward;
-
-        return time_step;
+        cout << "Created environment '" << env_name << "' with render mode '" << render_mode << "'\n";
     }
 
-    GridWorldEnv() : gen(rd()), dist_x(0, kGridSize_h - 1), dist_y(0, kGridSize_v - 1) {
-        reset();
+    pair<vector<float>, unordered_map<string, float>> reset() override {
+        theta = uniform(-M_PI, M_PI);
+        theta_dot = uniform(-1.0f, 1.0f);
+        return { get_obs(), {} };
     }
 
-    void render_text() const {
-        system("cls");
+    tuple<vector<float>, float, bool, bool, unordered_map<string, float>> step(const vector<float>& action) override {
+        float torque = std::clamp(action[0], -max_torque, max_torque);
 
-        for (int y = 0; y < kGridSize_v; ++y) {
-            for (int x = 0; x < kGridSize_h; ++x) {
-                if (x == agent_x && y == agent_y) {
-                    std::cout << "A";  // Agent
-                }
-                else if (x == target_x && y == target_y) {
-                    std::cout << "T";  // Target
-                }
-                else {
-                    std::cout << ".";
-                }
-            }
-            std::cout << '\n';
-        }
+        // physics
+        float new_theta_dot = theta_dot + (-3.0f * gravity / (2.0f * length) * sin(theta + M_PI) + 3.0f / (mass * length * length) * torque) * dt;
+        theta_dot = std::clamp(new_theta_dot, -max_speed, max_speed);
+        theta += theta_dot * dt;
+
+        float cost = angle_normalize(theta) * angle_normalize(theta) + 0.1f * theta_dot * theta_dot + 0.001f * torque * torque;
+        return { get_obs(), -cost, false, false, {} };
     }
 
-    std::vector<uint8_t> render(int& width, int& height) const {
-        const int pixel_size = 4;
-        width = kGridSize_h * pixel_size;
-        height = kGridSize_v * pixel_size;
-        std::vector<uint8_t> image(width * height * 3, 255);  // white background
+    void render() override {
+        cout << "Theta: " << theta << " | Theta_dot: " << theta_dot << "\n";
+    }
 
-        auto draw_cell = [&](int x, int y, uint8_t r, uint8_t g, uint8_t b) {
-            for (int dy = 0; dy < pixel_size; ++dy) {
-                for (int dx = 0; dx < pixel_size; ++dx) {
-                    int px = x * pixel_size + dx;
-                    int py = y * pixel_size + dy;
-                    int idx = (py * width + px) * 3;
-                    image[idx + 0] = r;
-                    image[idx + 1] = g;
-                    image[idx + 2] = b;
-                }
-            }
-            };
+    Space observation_space() const override {
+        return obs_space;
+    }
 
-        for (int y = 0; y < kGridSize_v; ++y) {
-            for (int x = 0; x < kGridSize_h; ++x) {
-                if (x == agent_x && y == agent_y)
-                    draw_cell(x, y, 0, 0, 255);      // Blue for agent
-                else if (x == target_x && y == target_y)
-                    draw_cell(x, y, 255, 0, 0);      // Red for target
-                else
-                    draw_cell(x, y, 200, 200, 200);  // Light gray for empty
-            }
-        }
-
-        return image;
+    Space action_space() const override {
+        return act_space;
     }
 
 private:
-    int agent_x = 0, agent_y = 0;
-    int target_x = 0, target_y = 0;
-    int step_count = 0;
-    std::random_device rd;
-    std::mt19937 gen;
-    std::uniform_int_distribution<> dist_x;
-    std::uniform_int_distribution<> dist_y;
+    string env_name;
+    string render_mode;
+    Space obs_space;
+    Space act_space;
 
-    TimeStep time_step;
-};
+    float theta = 0.0f;
+    float theta_dot = 0.0f;
 
-struct NormalDistribution {
-    torch::Tensor mean;
-    torch::Tensor sigma; //Standard deviation
+    const float max_torque = 2.0f;
+    const float max_speed = 8.0f;
+    const float dt = 0.05f;
+    const float gravity = 10.0f;
+    const float mass = 1.0f;
+    const float length = 1.0f;
 
-    NormalDistribution(const torch::Tensor& mean, const torch::Tensor& sigma)
-        : mean(mean), sigma(sigma) {
+    vector<float> get_obs() {
+        return { cos(theta), sin(theta), theta_dot };
     }
 
-    torch::Tensor sample() const {
-        return mean + sigma * torch::randn_like(mean);
+    float uniform(float low, float high) {
+        return low + static_cast<float>(rand()) / RAND_MAX * (high - low);
     }
 
-    torch::Tensor log_prob(const torch::Tensor& value) const {
-        static const double log_sqrt_2pi = std::log(std::sqrt(2.0 * M_PI));
-        torch::Tensor var = sigma * sigma;
-        return -((value - mean).pow(2) / (2.0 * var)) - sigma.log() - log_sqrt_2pi;
-    }
-
-    torch::Tensor entropy() const {
-        static const double log_sqrt_2pi_e = 0.5 * std::log(2.0 * M_PI * std::exp(1.0));
-        return sigma.log() + log_sqrt_2pi_e;
+    float angle_normalize(float x) {
+        while (x > M_PI) x -= 2.0f * M_PI;
+        while (x < -M_PI) x += 2.0f * M_PI;
+        return x;
     }
 };
 
-struct ObsStats {
-    torch::Tensor mean;
-    torch::Tensor var;
-    int64_t count;
 
-    ObsStats() : mean(torch::zeros({})), var(torch::ones({})), count(0) {}
 
-    void save(torch::serialize::OutputArchive& archive, const std::string& prefix) const {
-        archive.write(prefix + "_mean", mean);
-        archive.write(prefix + "_var", var);
-        archive.write(prefix + "_count", torch::tensor(count, torch::kInt64));
+/// <summary>
+
+/// </summary>
+
+struct FeedForwardNNImpl : torch::nn::Module {
+    torch::nn::Linear layer1{ nullptr }, layer2{ nullptr }, layer3{ nullptr };
+
+    FeedForwardNNImpl(int in_dim, int out_dim) {
+        layer1 = register_module("layer1", torch::nn::Linear(in_dim, 64));
+        layer2 = register_module("layer2", torch::nn::Linear(64, 64));
+        layer3 = register_module("layer3", torch::nn::Linear(64, out_dim));
     }
 
-    void load(torch::serialize::InputArchive& archive, const std::string& prefix) {
-        archive.read(prefix + "_mean", mean);
-        archive.read(prefix + "_var", var);
-        torch::Tensor count_tensor;
-        archive.read(prefix + "_count", count_tensor);
-        count = count_tensor.item<int64_t>();
-    }
-};
-
-class SimpleTensorBoardLogger {
-    std::ofstream file;
-    std::mutex mtx;
-
-public:
-    SimpleTensorBoardLogger(const std::string& filepath) {
-        namespace fs = std::filesystem;
-        if (auto dir = fs::path(filepath).parent_path(); !dir.empty())
-            fs::create_directories(dir);
-
-        file.open(filepath, std::ios::app);
-        if (!file) throw std::runtime_error("Failed to open " + filepath);
-
-        if (file.tellp() == 0) file << "step,tag,value\n";
-    }
-
-    void add_scalar(const std::string& tag, double value, int step) {
-        std::lock_guard lock(mtx);
-        file << step << ',' << tag << ',' << value << '\n';
-        file.flush();
-    }
-
-    ~SimpleTensorBoardLogger() { if (file.is_open()) file.close(); }
-};
-
-void init_weights(torch::nn::Module& module, double gain) {
-    if (auto* linear = module.as<torch::nn::Linear>()) {
-        torch::nn::init::orthogonal_(linear->weight, gain);
-        if (linear->bias.defined()) {
-            linear->bias.data().fill_(0.0);
+    torch::Tensor forward(torch::Tensor obs) {
+        try {
+            auto activation1 = torch::relu(layer1(obs));
+            auto activation2 = torch::relu(layer2(activation1));
+            return layer3(activation2);
+        }
+        catch (const std::exception& e) {
+            std::cerr << "Exception in forward: " << e.what() << std::endl;
+            throw;  // rethrow or handle as needed
         }
     }
-}
-
-// Actor Network
-struct ActorNetworkImpl : torch::nn::Module{
-    torch::nn::Linear fc1{ nullptr }, fc2{ nullptr }, mu{ nullptr };
-    torch::Tensor log_sigma;
-
-    ActorNetworkImpl(int64_t obs_size, int64_t action_size) {
-        fc1 = register_module("fc1", torch::nn::Linear(obs_size, 64));
-        fc2 = register_module("fc2", torch::nn::Linear(64, 64));
-        mu = register_module("mu", torch::nn::Linear(64, action_size));
-        log_sigma = register_parameter("log_sigma", torch::zeros({ 1, action_size }));
-
-        std::map<torch::nn::Module*, double> module_gains{
-            {fc1.get(), std::sqrt(2.0)},
-            {fc2.get(), std::sqrt(2.0)},
-            {mu.get(), 0.01}
-        };
-
-        for (auto& mg : module_gains) {
-            init_weights(*mg.first, mg.second);
-        }
-    }
-
-    NormalDistribution forward(torch::Tensor x) {
-        if (x.dim() == 1) x = x.unsqueeze(0);
-
-        x = torch::tanh(fc1->forward(x));
-        x = torch::tanh(fc2->forward(x));
-        auto mu_out = mu->forward(x);
-        auto sigma = torch::exp(log_sigma).expand_as(mu_out).to(x.device());
-        return NormalDistribution(mu_out, sigma);
-    }
 };
-TORCH_MODULE(ActorNetwork);
-
-// Critic Network
-struct CriticNetworkImpl : torch::nn::Module {
-    torch::nn::Linear fc1{ nullptr }, fc2{ nullptr }, v{ nullptr };
-
-    CriticNetworkImpl(int64_t obs_size, int64_t action_size) {
-        fc1 = register_module("fc1", torch::nn::Linear(obs_size, 64));
-        fc2 = register_module("fc2", torch::nn::Linear(64, 64));
-        v = register_module("v", torch::nn::Linear(64, 1));
-
-        std::map<torch::nn::Module*, double> module_gains{
-            {fc1.get(), std::sqrt(2.0)},
-            {fc2.get(), std::sqrt(2.0)},
-            {v.get(), 1.0}
-        };
-
-        for (auto& mg : module_gains) {
-            init_weights(*mg.first, mg.second);
-        }
-    }
-
-    torch::Tensor forward(torch::Tensor x) {
-        if (x.dim() == 1) x = x.unsqueeze(0);
-        x = x.to(torch::kFloat32);
-
-        x = torch::tanh(fc1->forward(x));
-        x = torch::tanh(fc2->forward(x));
-        return v->forward(x).view(-1);
-    }
-};
-TORCH_MODULE(CriticNetwork);
+TORCH_MODULE(FeedForwardNN);
 
 class PPO {
 public:
-    PPO(const ArgList& arglist) : arglist(arglist), device(torch::kCPU) {
-        // Seed RNGs
-        std::srand(arglist.seed);
-        torch::manual_seed(arglist.seed);
+    FeedForwardNN actor = nullptr;
+    FeedForwardNN critic = nullptr;
 
-        device = !torch::cuda::is_available() ? torch::Device(torch::kCUDA, 0) : torch::Device(torch::kCPU);
+    PPO(Env& env, const unordered_map<string, float>& hyperparameters)
+        : env(env) {
 
-        actor = ActorNetwork(env.kObsSize, env.kNumActions);
-        actor->to(device);
+        _init_hyperparameters(hyperparameters);
 
-        if (arglist.mode == "train") {
-            critic = CriticNetwork(env.kObsSize, env.kNumActions);
-            critic->to(device);
+        obs_dim = env.observation_space().shape[0];
+        act_dim = env.action_space().shape[0];
 
-            std::filesystem::path path = "./log/" + arglist.domain + "_" + arglist.task;
-            exp_dir = path / ("seed_" + std::to_string(arglist.seed));
-            model_dir = exp_dir / "models";
-            tensorboard_dir = exp_dir / "tensorboard";
+        actor = FeedForwardNN(obs_dim, act_dim);
+        critic = FeedForwardNN(obs_dim, 1);
 
-            if (arglist.resume) {
-                torch::serialize::InputArchive archive;
-                archive.load_from((model_dir / "backup.ckpt").string());
+        actor_optim = std::make_unique<torch::optim::Adam>(actor->parameters(), torch::optim::AdamOptions(lr));
+        critic_optim = std::make_unique<torch::optim::Adam>(critic->parameters(), torch::optim::AdamOptions(lr));
 
-                // Load episode
-                torch::Tensor episode_tensor;
-                archive.read("episode", episode_tensor);
-                start_episode = episode_tensor.item<int>() + 1;
+        cov_var = torch::full({ act_dim }, 0.5);
+        cov_mat = cov_var.diag();
 
-                // Load actor
-                torch::serialize::InputArchive actor_archive;
-                archive.read("actor", actor_archive);
-                actor->load(actor_archive);
-
-                // Load critic
-                torch::serialize::InputArchive critic_archive;
-                archive.read("critic", critic_archive);
-                critic->load(critic_archive);
-
-                // Load obs_stats fields
-                archive.read("obs_stats_mean", obs_stats.mean);
-                archive.read("obs_stats_var", obs_stats.var);
-
-                torch::Tensor count_tensor;
-                archive.read("obs_stats_count", count_tensor);
-                obs_stats.count = count_tensor.item<int>();
-
-                // Re-create optimizers
-                actor_optimizer = std::make_unique<torch::optim::Adam>(actor->parameters(), torch::optim::AdamOptions(arglist.lr));
-                critic_optimizer = std::make_unique<torch::optim::Adam>(critic->parameters(), torch::optim::AdamOptions(arglist.lr));
-
-                // Load optimizer states
-                torch::serialize::InputArchive actor_opt_archive;
-                archive.read("actor_optim", actor_opt_archive);
-                actor_optimizer->load(actor_opt_archive);
-
-                torch::serialize::InputArchive critic_opt_archive;
-                archive.read("critic_optim", critic_opt_archive);
-                critic_optimizer->load(critic_opt_archive);
-
-                std::cout << "Done loading checkpoint ..." << std::endl;
-            }
-            else {
-              start_episode = 0;
-
-              if (!std::filesystem::exists(path))
-                  std::filesystem::create_directories(path);
-              std::filesystem::create_directories(exp_dir);
-              std::filesystem::create_directories(tensorboard_dir);
-              std::filesystem::create_directories(model_dir);
-
-              actor_optimizer = std::make_unique<torch::optim::Adam>(actor->parameters(), torch::optim::AdamOptions(arglist.lr));
-              critic_optimizer = std::make_unique<torch::optim::Adam>(critic->parameters(), torch::optim::AdamOptions(arglist.lr));
-            }
-            train_simplified();
-        }
+        logger["delta_t"] = chrono::high_resolution_clock::now().time_since_epoch().count();
+        logger["t_so_far"] = 0;
+        logger["i_so_far"] = 0;
     }
 
-    std::tuple<torch::Tensor, double, bool> process_observation(const TimeStep& time_step) {
-        std::vector<torch::Tensor> obs_tensors;
-        for (const auto& [_, val] : time_step.observation) {
-            obs_tensors.push_back(val.unsqueeze(0).to(torch::kFloat32));
-        }
-        torch::Tensor obs = torch::cat(obs_tensors, 0);
-        double r = time_step.reward;
-        bool done = time_step.done;
-        return { obs, r, done };
-    }
+    struct MultivariateNormal {
+        torch::Tensor mean, cov, chol, inv_cov;
+        float log_det;
 
-    torch::Tensor normalize_observation(const torch::Tensor& o, bool update = false) {
-        static torch::Tensor running_mean = torch::zeros_like(o);
-        static torch::Tensor running_var = torch::ones_like(o);
-        static int64_t count = 1;
-
-        if (update) {
-            count += 1;
-            torch::Tensor delta = o - running_mean;
-            running_mean += delta / count;
-            torch::Tensor delta2 = o - running_mean;
-            running_var += delta * delta2;
+        MultivariateNormal(const torch::Tensor& mean_, const torch::Tensor& cov_)
+            : mean(mean_), cov(cov_) {
+            chol = torch::linalg_cholesky(cov);
+            inv_cov = torch::linalg_inv(cov);
+            log_det = torch::logdet(cov).item<float>();
         }
 
-        torch::Tensor var_s = running_var / count;
-        torch::Tensor mean = running_mean;
-
-        bool has_nan = var_s.isnan().any().item<bool>();
-        bool has_zero = (var_s == 0).any().item<bool>();
-
-        torch::Tensor norm_obs;
-        if (has_nan || has_zero) {
-            norm_obs = o - mean;
-        }
-        else {
-            norm_obs = (o - mean) / torch::sqrt(var_s + 1e-8);
+        torch::Tensor sample() const {
+            auto eps = torch::randn_like(mean);
+            return mean + torch::matmul(chol, eps);
         }
 
-        return torch::clamp(norm_obs, -10.0, 10.0);
-    }
-
-    void save_checkpoint(const std::string& name) {
-        try {
-            torch::serialize::OutputArchive archive;
-
-            torch::serialize::OutputArchive actor_archive;
-            actor->save(actor_archive);
-            archive.write("actor", actor_archive);
-
-            torch::serialize::OutputArchive critic_archive;
-            critic->save(critic_archive);
-            archive.write("critic", critic_archive);
-
-            archive.write("obs_stats_mean", obs_stats.mean);
-            archive.write("obs_stats_var", obs_stats.var);
-            archive.write("obs_stats_count", torch::tensor(obs_stats.count, torch::kInt32));
-            std::string save_file = (model_dir / name).string();
-            archive.save_to(save_file);
+        torch::Tensor log_prob(const torch::Tensor& x) const {
+            try {
+                auto diff = (x - mean).unsqueeze(-1);
+                // Ensure dimensions are correct before matmul
+                auto diff_transposed = diff.transpose(-2, -1);  // transpose last two dims
+                auto exponent = -0.5 * torch::matmul(diff_transposed, torch::matmul(inv_cov, diff)).squeeze();
+                return exponent - 0.5 * mean.size(0) * std::log(2 * M_PI) - 0.5 * log_det;
+            }
+            catch (const std::exception& e) {
+                std::cerr << "Exception in log_prob: " << e.what() << std::endl;
+                throw;
+            }
         }
-        catch (const c10::Error& e) {
-            std::cerr << "Exception during save_checkpoint: " << e.what() << std::endl;
-        }
-    }
+    };
 
-    void save_backup(int episode) {
-        try {
-            torch::serialize::OutputArchive archive;
-            archive.write("episode", torch::tensor({ episode }, torch::kInt32));
-            torch::serialize::OutputArchive actor_archive;
-            actor->save(actor_archive);
-            archive.write("actor", actor_archive);
-            torch::serialize::OutputArchive critic_archive;
-            critic->save(critic_archive);
-            archive.write("critic", critic_archive);
-            torch::serialize::OutputArchive actor_optim_archive;
-            actor_optimizer->save(actor_optim_archive);
-            archive.write("actor_optim", actor_optim_archive);
-            torch::serialize::OutputArchive critic_optim_archive;
-            critic_optimizer->save(critic_optim_archive);
-            archive.write("critic_optim", critic_optim_archive);
-            archive.write("obs_stats_mean", obs_stats.mean);
-            archive.write("obs_stats_var", obs_stats.var);
-            archive.write("obs_stats_count", torch::tensor(obs_stats.count, torch::kInt32));
-            archive.save_to((model_dir / "backup.ckpt").string());
-        }
-        catch (const c10::Error& e) {
-            std::cerr << "Exception during save_backup: " << e.what() << std::endl;
-        }
-    }
+    void learn(int total_timesteps) {
+        cout << "Learning... Running " << max_timesteps_per_episode
+            << " timesteps per episode, " << timesteps_per_batch
+            << " timesteps per batch for a total of "
+            << total_timesteps << " timesteps" << endl;
 
-    void log_training_metrics(const std::string& key, double value = 0.0) {
-        static std::unordered_map<std::string, std::vector<double>> metric_log;
-        static bool header_printed = false;
-        return;
-        const std::vector<std::pair<std::string, std::string>> metrics = {
-            {"episode",       "Episode"},
-            {"reward",        "Reward (↑)"},
-            {"eval_reward",   "EvalReward (↑ stable)"},
-            {"adv_mean",      "AdvMean (~0)"},
-            {"adv_std",       "AdvStd (!=0)"},
-            {"ratio_mean",    "RatioMean (~1)"},
-            {"ratio_std",     "RatioStd (<0.2)"},
-            {"actor_loss",    "ActorLoss (↓)"},
-            {"critic_loss",   "CriticLoss (↓)"}
-        };
+        int t_so_far = 0;
+        int i_so_far = 0;
 
-        if (key == "draw") {
-            if (!header_printed) {
-                for (const auto& [k, label] : metrics)
-                    std::cout << std::setw(14) << label << "\t\t";
-                std::cout << '\n';
-                header_printed = true;
+        while (t_so_far < total_timesteps) {
+            // ALG STEP 2-3: Rollout to collect a batch of trajectories
+            auto [batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_lengths] = rollout();
+
+            // Count how many timesteps we collected
+            t_so_far += batch_lengths.sum().item<int>();
+
+            // Count iterations
+            i_so_far += 1;
+
+            // Logging
+            logger["t_so_far"] = t_so_far;
+            logger["i_so_far"] = i_so_far;
+
+            // Evaluate current value function and policy log probs
+            auto [V, _] = evaluate(batch_obs, batch_acts);
+
+            // Advantage estimation
+            torch::Tensor A_k = batch_rtgs - V.detach();
+
+            // Normalize advantages
+            A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10);
+
+            // PPO update for multiple epochs
+            for (int epoch = 0; epoch < n_updates_per_iteration; ++epoch) {
+                auto [V, curr_log_probs] = evaluate(batch_obs, batch_acts);
+
+                // Compute ratio of new and old policy probabilities
+                torch::Tensor ratios = torch::exp(curr_log_probs - batch_log_probs);
+
+                // Compute surrogate losses
+                torch::Tensor surr1 = ratios * A_k;
+                torch::Tensor surr2 = torch::clamp(ratios, 1 - clip, 1 + clip) * A_k;
+
+                // Compute losses
+                torch::Tensor actor_loss = -torch::min(surr1, surr2).mean();
+                torch::Tensor critic_loss = torch::mse_loss(V, batch_rtgs);
+
+                // Backpropagate actor loss
+                actor_optim->zero_grad();
+                actor_loss.backward({}, /* retain_graph */ true);
+                actor_optim->step();
+
+                // Backpropagate critic loss
+                critic_optim->zero_grad();
+                critic_loss.backward();
+                critic_optim->step();
+
+                // Logging actor loss
+                logger["actor_loss"] = actor_loss;
             }
 
-            for (const auto& [k, _] : metrics) {
-                const auto& vec = metric_log[k];
-                if (!vec.empty()) {
-                    std::cout << std::setw(14) << vec.back() << "\t\t";
-                }
-                else {
-                    std::cout << std::setw(14) << "N/A" << "\t\t";
-                }
-            }
-            std::cout << '\n';
-        }
-        else {
-            metric_log[key].push_back(value);
-        }
-    }
+            // Print training summary
+            _log_summary();
 
-    void train_simplified() {
-        SimpleTensorBoardLogger logger("runs/log_dir");
-
-        struct RolloutResult {
-            std::vector<torch::Tensor> observations;
-            std::vector<torch::Tensor> actions;
-            std::vector<torch::Tensor> old_log_probs;
-            std::vector<torch::Tensor> state_values;
-            std::vector<torch::Tensor> rewards;
-            torch::Tensor current_observation;
-            double total_reward;
-            bool done;
-        };
-
-        auto collect_rollout = [&](torch::Tensor start_obs) -> RolloutResult {
-            RolloutResult result;
-            result.current_observation = start_obs;
-            result.total_reward = 0.0;
-            int timestep = 0;
-            while (true) {
-                torch::Tensor obs_batch = result.current_observation.unsqueeze(0).to(device);
-                auto dist = actor->forward(obs_batch);
-                auto value = critic->forward(obs_batch)[0];
-                auto action = dist.sample();
-                result.observations.push_back(obs_batch[0]);
-                result.actions.push_back(action[0].detach());
-                result.old_log_probs.push_back(dist.log_prob(action).sum().detach());
-                result.state_values.push_back(value);
-                auto [next_raw_obs, reward, done] = process_observation(env.step(action));
-                result.current_observation = normalize_observation(next_raw_obs, true);
-                result.rewards.push_back(torch::tensor(reward, torch::kFloat32).to(device));
-                result.total_reward += reward;
-                timestep++;
-                if (done || (timestep % arglist.update_every) == 0) {
-                    result.done = done;
-                    result.state_values.push_back(critic->forward(result.current_observation.unsqueeze(0).to(device))[0].detach());
-                    break;
-                }
-            }
-            return result;
-            };
-
-        auto compute_returns_and_advantages = [&](const RolloutResult& data) {
-            std::vector<torch::Tensor> returns;
-            torch::Tensor discounted = data.state_values.back();
-            for (int i = static_cast<int>(data.rewards.size()) - 1; i >= 0; --i) {
-                discounted = data.rewards[i] + arglist.gamma * discounted;
-                returns.push_back(discounted);
-            }
-            std::reverse(returns.begin(), returns.end());
-            auto obs_tensor = torch::stack(data.observations);
-            auto act_tensor = torch::stack(data.actions);
-            auto old_log_tensor = torch::stack(data.old_log_probs);
-            auto value_tensor = torch::stack(data.state_values).slice(0, 0, returns.size());
-            auto ret_tensor = torch::stack(returns);
-            auto adv_tensor = (ret_tensor - value_tensor).detach();
-            log_training_metrics("adv_mean", adv_tensor.mean().item<double>());
-            log_training_metrics("adv_std", adv_tensor.std(false).item<double>());
-            return std::make_tuple(obs_tensor, act_tensor, old_log_tensor, value_tensor, ret_tensor, adv_tensor);
-            };
-
-        auto run_ppo_update = [&](torch::Tensor obs, torch::Tensor act, torch::Tensor old_log, torch::Tensor val,
-            torch::Tensor rets, torch::Tensor adv, int episode_index) {
-                for (int epoch = 0; epoch < arglist.epochs; ++epoch) {
-                    auto perm = torch::randperm(obs.size(0));
-                    double actor_loss_sum = 0.0, critic_loss_sum = 0.0;
-                    int batch_count = 0;
-                    for (int start = 0; start < obs.size(0); start += arglist.batch_size) {
-                        auto indices = perm.slice(0, start, std::min(start + arglist.batch_size, (int)obs.size(0)));
-                        auto b_obs = obs.index_select(0, indices);
-                        auto b_act = act.index_select(0, indices);
-                        auto b_old_log = old_log.index_select(0, indices);
-                        auto b_adv = adv.index_select(0, indices);
-                        auto b_ret = rets.index_select(0, indices);
-                        if (b_adv.numel() > 1)
-                            b_adv = (b_adv - b_adv.mean()) / torch::clamp(b_adv.std(), 1e-5);
-
-                        auto dist = actor->forward(b_obs);
-                        auto val_est = critic->forward(b_obs);
-                        auto log_probs = dist.log_prob(b_act).sum(1);
-                        auto ratio = torch::exp(log_probs - b_old_log);
-
-                        log_training_metrics("ratio_mean", ratio.mean().item<double>());
-                        log_training_metrics("ratio_std", ratio.std(false).item<double>());
-
-                        auto surr1 = ratio * b_adv;
-                        auto surr2 = torch::clamp(ratio, 1 - arglist.ppo_clip_term, 1 + arglist.ppo_clip_term) * b_adv;
-                        auto actor_loss = -torch::min(surr1, surr2).mean();
-                        auto critic_loss = 0.5 * torch::mse_loss(val_est, b_ret);
-
-                        if (actor_loss.isnan().item<bool>() || critic_loss.isnan().item<bool>()) {
-                            break;
-                        }
-                        actor_loss_sum += actor_loss.item<double>();
-                        critic_loss_sum += critic_loss.item<double>();
-                        batch_count++;
-                        auto total_loss = actor_loss + critic_loss;
-                        try {
-                            actor_optimizer->zero_grad();
-                            critic_optimizer->zero_grad();
-                            total_loss.backward();
-                            torch::nn::utils::clip_grad_norm_(actor->parameters(), arglist.gradient_clip_term);
-                            torch::nn::utils::clip_grad_norm_(critic->parameters(), arglist.gradient_clip_term);
-                            actor_optimizer->step();
-                            critic_optimizer->step();
-                        }
-                        catch (const c10::Error& e) {
-                            std::cerr << "Backward pass error: " << e.what() << "\n";
-                        }
-                    }
-                    if (batch_count > 0) {
-                        log_training_metrics("actor_loss", actor_loss_sum / batch_count);
-                        log_training_metrics("critic_loss", critic_loss_sum / batch_count);
-                    }
-                }
-            };
-
-        for (int episode_index = start_episode; episode_index < arglist.episodes; ++episode_index) {
-            auto [raw_obs, _, __] = process_observation(env.reset());
-            torch::Tensor obs = normalize_observation(raw_obs, true);
-            auto rollout = collect_rollout(obs);
-            auto [obs_tensor, act_tensor, old_log_tensor, val_tensor, ret_tensor, adv_tensor] = compute_returns_and_advantages(rollout);
-            run_ppo_update(obs_tensor, act_tensor, old_log_tensor, val_tensor, ret_tensor, adv_tensor, episode_index);
-            //if (rollout.done) 
-            {
-                log_training_metrics("episode", episode_index);
-                log_training_metrics("reward", rollout.total_reward);
-                logger.add_scalar("episode_reward", rollout.total_reward, episode_index);
-                if (episode_index % arglist.eval_every == 0 || episode_index == arglist.episodes - 1) {
-                    auto eval_rewards = eval(arglist.eval_over, true, false);
-                    double mean = std::accumulate(eval_rewards.begin(), eval_rewards.end(), 0.0) / eval_rewards.size();
-                    logger.add_scalar("evaluation_reward", mean, episode_index);
-                    save_checkpoint(std::to_string(episode_index) + ".ckpt");
-                }
-                log_training_metrics("draw");
-                if ((episode_index % 250 == 0 || episode_index == arglist.episodes - 1) && episode_index > start_episode) {
-                    save_backup(episode_index);
-                }
+            // Save model
+            if (i_so_far % save_freq == 0) {
+                torch::save(actor, "./ppo_actor.pt");
+                torch::save(critic, "./ppo_critic.pt");
             }
         }
     }
 
-    std::vector<double> eval(int episodes, bool render = false, bool save_video = false) {
-        int t = 0;
-        std::string folder;
-        if (render && save_video) {
-            folder = "./media/" + arglist.domain + "_" + arglist.task;
-            std::system(("mkdir -p " + folder).c_str());
-        }
+    tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rollout() {
+        // Batch data. For more details, check function header.
+        vector<vector<float>> batch_obs_vec;
+        vector<vector<float>> batch_acts_vec;
+        vector<float> batch_log_probs_vec;
+        vector<vector<float>> batch_rewards;
+        vector<int> batch_lengths_vec;
 
-        std::vector<double> ep_r_list;
+        // Episodic data. Keeps track of rewards per episode, will get cleared
+        // upon each new episode
+        vector<float> ep_rews;
 
-        for (int episode = 0; episode < episodes; ++episode) {
-            torch::Tensor o;
-            double ep_r = 0.0;
-            decltype(env.reset()) reset_result = env.reset();
-            std::tie(o, std::ignore, std::ignore) = process_observation(reset_result);
-            o = normalize_observation(o);
+        int t = 0; // Keeps track of how many timesteps we've run so far this batch
 
-            //matplotlibcpp::image* vid = nullptr;
+        // Keep simulating until we've run more than or equal to specified timesteps per batch
+        while (t < timesteps_per_batch) {
+            ep_rews.clear(); // rewards collected per episode
 
-            while (true) {
-                torch::NoGradGuard no_grad;
-                auto dist = actor->forward(o.to(torch::kFloat32).unsqueeze(0).to(device));
-                auto a_tensor = dist.sample();
+            // Reset the environment. Note that obs is short for observation.
+            auto [obs, _] = env.reset();
+            bool done = false;
 
-                //std::cout << "dist.mean: " << dist.mean << std::endl;
-                //std::cout << "dist.stddev: " << dist.sigma << std::endl;
-                //std::cout << "dist.entropy: " << dist.entropy() << std::endl;
-                //std::cout << "a_tensor: " << a_tensor << std::endl;
-                //auto a = a_tensor.cpu().squeeze(0).item<double>();
-
-                auto step_result = env.step(a_tensor);
-                torch::Tensor o_1;
-                double r;
-                bool done;
-                std::tie(o_1, r, done) = process_observation(step_result);
-                o_1 = normalize_observation(o_1);
-
-                if (render) {
-                    try {
-                        int width, height;
-                        auto img = env.render(width, height); // returns std::vector<uint8_t> RGB image
-
-                        if (save_video) {
-                            if (!ffmpeg_started) {
-                                std::filesystem::create_directories(folder);
-                                std::string output_path = folder + "/output.mp4";
-                                ffmpeg_writer = std::make_unique<FFmpegWriter>(output_path, width, height, fps);
-                                ffmpeg_started = true;
-                            }
-
-                            ffmpeg_writer->write_frame(img.data());
-                        }
-                    }
-                    catch (const std::exception& e) {
-                        std::cerr << "Render or video write failed: " << e.what() << std::endl;
-                    }
+            // Run an episode for a maximum of max_timesteps_per_episode timesteps
+            for (int ep_t = 0; ep_t < max_timesteps_per_episode; ++ep_t) {
+                // If render is specified, render the environment
+                if (render && (std::get<int>(logger["i_so_far"]) % render_every_i == 0) && batch_lengths_vec.empty()) {
+                    env.render();
                 }
 
-                ep_r += r;
-                o = o_1;
+                t += 1; // Increment timesteps ran this batch so far
 
+                // Track observations in this batch
+                batch_obs_vec.push_back(obs);
+
+                // Calculate action and make a step in the env.
+                // Note that rew is short for reward.
+                auto [action, log_prob] = get_action(obs);
+                auto [next_obs, rew, terminated, truncated, __] = env.step(action);
+
+                // Don't really care about the difference between terminated or truncated in this, so just combine them
+                done = terminated || truncated;
+
+                // Track recent reward, action, and action log probability
+                ep_rews.push_back(rew);
+                batch_acts_vec.push_back(action);
+                batch_log_probs_vec.push_back(log_prob);
+
+                obs = next_obs;
+
+                // If the environment tells us the episode is terminated, break
                 if (done) {
-                    ep_r_list.push_back(ep_r);
-                    if (render) {
-                        //matplotlibcpp::pause(0.5);
-                    }
                     break;
                 }
             }
+
+            // Track episodic lengths and rewards
+            batch_lengths_vec.push_back(ep_rews.size());
+            batch_rewards.push_back(ep_rews);
         }
 
-        if (arglist.mode == "eval") {
-            double mean_return = std::accumulate(ep_r_list.begin(), ep_r_list.end(), 0.0) / ep_r_list.size();
-            std::cout << "Average return : " << mean_return << std::endl;
+        // Reshape data as tensors in the shape specified in function description, before returning
+        torch::Tensor batch_obs = torch::from_blob(batch_obs_vec.data(), { (int)batch_obs_vec.size(), (int)batch_obs_vec[0].size() }, torch::kFloat).clone();
+        torch::Tensor batch_acts = torch::from_blob(batch_acts_vec.data(), { (int)batch_acts_vec.size(), (int)batch_acts_vec[0].size() }, torch::kFloat).clone();
+        torch::Tensor batch_log_probs = torch::from_blob(batch_log_probs_vec.data(), { (int)batch_log_probs_vec.size() }, torch::kFloat).clone();
+        torch::Tensor batch_rtgs = compute_rtgs(batch_rewards); // ALG STEP 4
+        torch::Tensor batch_lengths = torch::tensor(batch_lengths_vec, torch::kInt64);
 
-            if (save_video) {
-                std::system(("cd " + folder + " && ffmpeg -i file%04d.png -r 10 -vf pad=ceil(iw/2)*2:ceil(ih/2)*2 -pix_fmt yuv420p video.mp4").c_str());
-                std::system(("cd " + folder + " && rm *.png").c_str());
-                std::system(("cd " + folder + " && ffmpeg -i video.mp4 video.gif").c_str());
+        // Log the episodic returns and episodic lengths in this batch.
+        logger["batch_rewards"] = batch_rewards;
+        logger["batch_lengths"] = batch_lengths_vec;
+
+        return { batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_lengths };
+    }
+
+    torch::Tensor compute_rtgs(const vector<vector<float>>& batch_rewards) {
+        /**
+            Compute the Reward-To-Go of each timestep in a batch given the rewards.
+
+            Parameters:
+                batch_rewards - the rewards in a batch, Shape: (number of episodes, number of timesteps per episode)
+
+            Return:
+                batch_rtgs - the rewards to go, Shape: (number of timesteps in batch)
+        */
+
+        // The rewards-to-go (rtg) per episode per batch to return.
+        // The shape will be (num timesteps per episode)
+        vector<float> batch_rtgs;
+
+        // Iterate through each episode
+        for (auto it = batch_rewards.rbegin(); it != batch_rewards.rend(); ++it) {
+            const auto& ep_rews = *it;
+            float discounted_reward = 0; // The discounted reward so far
+
+            // Iterate through all rewards in the episode. We go backwards for smoother calculation of each
+            // discounted return (think about why it would be harder starting from the beginning)
+            for (auto rit = ep_rews.rbegin(); rit != ep_rews.rend(); ++rit) {
+                discounted_reward = *rit + discounted_reward * gamma;
+                batch_rtgs.insert(batch_rtgs.begin(), discounted_reward);
             }
         }
 
-        return ep_r_list;
+        // Convert the rewards-to-go into a tensor
+        return torch::tensor(batch_rtgs, torch::kFloat);
+    }
+
+    pair<vector<float>, float> get_action(const vector<float>& obs) {
+        /**
+            Queries an action from the actor network, should be called from rollout.
+
+            Parameters:
+                obs - the observation at the current timestep
+
+            Return:
+                action - the action to take, as a numpy array
+                log_prob - the log probability of the selected action in the distribution
+        */
+
+        // Query the actor network for a mean action
+        torch::Tensor obs_tensor = torch::from_blob((void*)obs.data(), { (int)obs.size() }, torch::kFloat).clone();
+        torch::Tensor mean = actor->forward(obs_tensor);
+
+        // Create a distribution with the mean action and std from the covariance matrix above.
+        // For more information on how this distribution works, check out Andrew Ng's lecture on it:
+        // https://www.youtube.com/watch?v=JjB58InuTqM
+        torch::Tensor action_tensor = MultivariateNormal(mean, cov_mat).sample();
+
+        // Calculate the log probability for that action
+        torch::Tensor log_prob_tensor = MultivariateNormal(mean, cov_mat).log_prob(action_tensor);
+
+        // Return the sampled action and the log probability of that action in our distribution
+        vector<float> action(action_tensor.data_ptr<float>(), action_tensor.data_ptr<float>() + action_tensor.numel());
+        return { action, log_prob_tensor.item<float>() };
+    }
+
+    pair<torch::Tensor, torch::Tensor> evaluate(const torch::Tensor& batch_obs, const torch::Tensor& batch_acts) {
+        /**
+            Estimate the values of each observation, and the log probs of
+            each action in the most recent batch with the most recent
+            iteration of the actor network. Should be called from learn.
+
+            Parameters:
+                batch_obs - the observations from the most recently collected batch as a tensor.
+                            Shape: (number of timesteps in batch, dimension of observation)
+                batch_acts - the actions from the most recently collected batch as a tensor.
+                            Shape: (number of timesteps in batch, dimension of action)
+
+            Return:
+                V - the predicted values of batch_obs
+                log_probs - the log probabilities of the actions taken in batch_acts given batch_obs
+        */
+
+        // Query critic network for a value V for each batch_obs. Shape of V should be same as batch_rtgs
+        torch::Tensor V = critic->forward(batch_obs).squeeze();
+
+        // Calculate the log probabilities of batch actions using most recent actor network.
+        // This segment of code is similar to that in get_action()
+        torch::Tensor mean = actor->forward(batch_obs);
+        MultivariateNormal dist(mean, cov_mat);
+        torch::Tensor log_probs = dist.log_prob(batch_acts);
+
+        // Return the value vector V of each observation in the batch
+        // and log probabilities log_probs of each action in the batch
+        return { V, log_probs };
     }
 
 private:
-    ArgList arglist;
-    GridWorldEnv env;
-    torch::Device device;
-    int start_episode;
-    ActorNetwork actor = nullptr;
-    CriticNetwork critic = nullptr;
+    void _init_hyperparameters(const unordered_map<string, float>& hyperparameters) {
+        /**
+            Initialize default and custom values for hyperparameters
 
-    std::filesystem::path exp_dir, model_dir, tensorboard_dir;
+            Parameters:
+                hyperparameters - the extra arguments included when creating the PPO model, should only include
+                                  hyperparameters defined below with custom values.
 
-    std::unique_ptr<torch::optim::Adam> actor_optimizer;
-    std::unique_ptr<torch::optim::Adam> critic_optimizer;
-    ObsStats obs_stats;
+            Return:
+                None
+        */
 
-    int frame_width = 640;
-    int frame_height = 480;
-    int fps = 30;
-    bool ffmpeg_started = false;
-    std::unique_ptr<FFmpegWriter> ffmpeg_writer;
+        // Initialize default values for hyperparameters
+        // Algorithm hyperparameters
+        timesteps_per_batch = 4800;               // Number of timesteps to run per batch
+        max_timesteps_per_episode = 1600;         // Max number of timesteps per episode
+        n_updates_per_iteration = 5;              // Number of times to update actor/critic per iteration
+        lr = 0.005;                              // Learning rate of actor optimizer
+        gamma = 0.95;                            // Discount factor to be applied when calculating Rewards-To-Go
+        clip = 0.2;                              // Recommended 0.2, helps define the threshold to clip the ratio during SGA
+
+        // Miscellaneous parameters
+        render = true;                          // If we should render during rollout
+        render_every_i = 10;                    // Only render every n iterations
+        save_freq = 10;                         // How often we save in number of iterations
+        seed = nullopt;                    // Sets the seed of our program, used for reproducibility of results
+
+        // Change any default values to custom values for specified hyperparameters
+        for (const auto& [param, val] : hyperparameters) {
+            if (param == "timesteps_per_batch") timesteps_per_batch = static_cast<int>(val);
+            else if (param == "max_timesteps_per_episode") max_timesteps_per_episode = static_cast<int>(val);
+            else if (param == "n_updates_per_iteration") n_updates_per_iteration = static_cast<int>(val);
+            else if (param == "lr") lr = val;
+            else if (param == "gamma") gamma = val;
+            else if (param == "clip") clip = val;
+            else if (param == "render") render = (val != 0.0);
+            else if (param == "render_every_i") render_every_i = static_cast<int>(val);
+            else if (param == "save_freq") save_freq = static_cast<int>(val);
+            else if (param == "seed") seed = static_cast<int>(val);
+            // Add more parameters here if needed
+        }
+
+        // Sets the seed if specified
+        if (seed.has_value()) {
+            // Set the seed
+            torch::manual_seed(seed.value());
+            cout << "Successfully set seed to " << seed.value() << endl;
+        }
+    }
+
+    void _log_summary() {
+        try {
+            long long prev_delta_t = std::get<long long>(logger["delta_t"]);
+            logger["delta_t"] = chrono::duration_cast<chrono::nanoseconds>(
+                chrono::high_resolution_clock::now().time_since_epoch()).count();
+            float delta_t_sec = (std::get<long long>(logger["delta_t"]) - prev_delta_t) / 1e9;
+
+            stringstream delta_t_ss;
+            delta_t_ss << fixed << setprecision(2) << delta_t_sec;
+            string delta_t = delta_t_ss.str();
+
+            int t_so_far = std::get<int>(logger["t_so_far"]);
+            int i_so_far = std::get<int>(logger["i_so_far"]);
+
+            vector<int> batch_lengths = std::get<vector<int>>(logger["batch_lengths"]);
+            float avg_ep_lens = 0.0;
+            if (!batch_lengths.empty()) {
+                avg_ep_lens = accumulate(batch_lengths.begin(), batch_lengths.end(), 0.0) / batch_lengths.size();
+            }
+
+            vector<vector<float>> batch_rewards = std::get<vector<vector<float>>>(logger["batch_rewards"]);
+            float avg_ep_rews = 0.0;
+            if (!batch_rewards.empty()) {
+                float sum_rews = 0.0;
+                int count = 0;
+                for (const auto& ep_rews : batch_rewards) {
+                    sum_rews += accumulate(ep_rews.begin(), ep_rews.end(), 0.0);
+                    count++;
+                }
+                avg_ep_rews = sum_rews / count;
+            }
+
+            auto actor_loss = std::get<torch::Tensor>(logger["actor_loss"]);
+            float avg_actor_loss = 0.0;
+            if (actor_loss.numel() > 0) {
+                if (actor_loss.dim() == 0) {
+                    // scalar tensor
+                    avg_actor_loss = actor_loss.item<float>();
+                }
+                else {
+                    float sum_loss = 0.0;
+                    for (int i = 0; i < actor_loss.size(0); ++i) {
+                        sum_loss += actor_loss[i].item<float>();
+                    }
+                    avg_actor_loss = sum_loss / actor_loss.size(0);
+                }
+            }
+
+            stringstream avg_ep_lens_ss, avg_ep_rews_ss, avg_actor_loss_ss;
+            avg_ep_lens_ss << fixed << setprecision(2) << avg_ep_lens;
+            avg_ep_rews_ss << fixed << setprecision(2) << avg_ep_rews;
+            avg_actor_loss_ss << fixed << setprecision(5) << avg_actor_loss;
+
+            cout << endl;
+            cout << "-------------------- Iteration #" << i_so_far << " --------------------" << endl;
+            cout << "Average Episodic Length: " << avg_ep_lens_ss.str() << endl;
+            cout << "Average Episodic Return: " << avg_ep_rews_ss.str() << endl;
+            cout << "Average Loss: " << avg_actor_loss_ss.str() << endl;
+            cout << "Timesteps So Far: " << t_so_far << endl;
+            cout << "Iteration took: " << delta_t << " secs" << endl;
+            cout << "------------------------------------------------------" << endl;
+            cout << endl;
+
+            logger["batch_lengths"] = vector<int>{};
+            logger["batch_rewards"] = vector<vector<float>>{};
+            logger["actor_loss"] = torch::Tensor();
+        }
+        catch (const std::exception& e) {
+            std::cerr << "Exception in _log_summary: " << e.what() << std::endl;
+        }
+    }
+
+    Env& env;
+    int obs_dim;
+    int act_dim;
+    float lr;
+
+    torch::Tensor cov_var;
+    torch::Tensor cov_mat;
+
+
+    unique_ptr<torch::optim::Adam> actor_optim;
+    unique_ptr<torch::optim::Adam> critic_optim;
+
+    using LoggerValue = variant<
+        string,
+        float,
+        int,
+        vector<float>,
+        vector<int>,
+        vector<torch::Tensor>,
+        vector<vector<float>>,
+        long long,
+        torch::Tensor
+    >;
+
+    unordered_map<string, LoggerValue> logger;
+    vector<int> batch_lengths;
+    vector<float> batch_rewards;
+
+    // Algorithm hyperparameters
+    int timesteps_per_batch;
+    int max_timesteps_per_episode;
+    int n_updates_per_iteration;
+    float gamma;
+    float clip;
+
+    // Miscellaneous parameters
+    bool render;
+    int render_every_i;
+    int save_freq;
+    optional<int> seed;
 };
 
-int main() {
-    system("mode con: cols=200");
-    std::cout << "LibTorch version: " << TORCH_VERSION << std::endl;
 
-    if (torch::cuda::is_available()) {
-        std::cout << "CUDA is available. GPU will be used.\n";
-        int deviceCount = 0;
-        cudaError_t err = cudaGetDeviceCount(&deviceCount);
+void train(
+    GymEnv& env,
+    const unordered_map<string, float>& hyperparameters,
+    const string& actor_model,
+    const string& critic_model
+) {
+    /**
+     * Trains the model.
+     *
+     * Parameters:
+     *   env - the environment to train on
+     *   hyperparameters - map of hyperparameters
+     *   actor_model - path to actor model file if continuing training
+     *   critic_model - path to critic model file if continuing training
+     *
+     * Return:
+     *   None
+     */
+    cout << "Training" << endl;
 
-        if (err != cudaSuccess || deviceCount == 0) {
-            std::cout << "Failed to get CUDA device count or no devices found.\n";
-            return 1;
-        }
+    PPO model(env, hyperparameters);  // Construct PPO with environment and hyperparameters
 
-        std::cout << "CUDA device count: " << deviceCount << "\n";
-
-        cudaDeviceProp deviceProp;
-        err = cudaGetDeviceProperties(&deviceProp, 0);
-        if (err == cudaSuccess) {
-            std::cout << "Current device name: " << deviceProp.name << "\n";
-        }
-        else {
-            std::cout << "Failed to get device properties.\n";
-        }
+    if (!actor_model.empty() && !critic_model.empty()) {
+        cout << "Loading in " << actor_model << " and " << critic_model << "..." << endl;
+        torch::load(model.actor, actor_model);
+        torch::load(model.critic, critic_model);
+        cout << "Successfully loaded." << endl;
+    }
+    else if (!actor_model.empty() || !critic_model.empty()) {
+        cerr << "Error: Either specify both actor/critic models or none at all. We don't want to accidentally override anything!" << endl;
+        exit(0);
     }
     else {
-        std::cout << "CUDA is NOT available. CPU will be used.\n";
+        cout << "Training from scratch." << endl;
     }
 
-    ArgList arglist;
-    PPO ppo(arglist);
+    // Train PPO model for a large number of timesteps
+    model.learn(200000000);
+}
+
+void test(GymEnv& env, const string& actor_model) {
+    /**
+     * Tests the model.
+     *
+     * Parameters:
+     *   env - the environment to test on
+     *   actor_model - path to actor model file
+     *
+     * Return:
+     *   None
+     */
+    cout << "Testing " << actor_model << endl;
+
+    if (actor_model.empty()) {
+        cerr << "Didn't specify model file. Exiting." << endl;
+        exit(0);
+    }
+
+    int obs_dim = env.observation_space().shape[0];
+    int act_dim = env.action_space().shape[0];
+
+    FeedForwardNN policy(obs_dim, act_dim);
+
+    torch::load(policy, actor_model);
+
+    //eval_policy(policy, env, /*render=*/true);
+}
+
+int main(int argc, char* argv[]) {
+    /**
+     * Main function to run.
+     *
+     * Parameters:
+     *   argc, argv - command line arguments
+     *
+     * Return:
+     *   None
+     */
+
+     // Parse arguments (you need to implement get_args or use your favorite CLI parser)
+     // 
+    // Hyperparameters for PPO (can be customized here)
+    unordered_map<string, float> hyperparameters = {
+        {"timesteps_per_batch", 2048},
+        {"max_timesteps_per_episode", 200},
+        {"gamma", 0.99},
+        {"n_updates_per_iteration", 10},
+        {"lr", 3e-4},
+        {"clip", 0.2},
+        {"render", 1},           // Using 1 for true
+        {"render_every_i", 10}
+    };
+
+    GymEnv env("Pendulum-v1", (true) ? "human" : "rgb_array");
+
+    if (true) {
+        train(env, hyperparameters, "", "");
+    }
+    else {
+        test(env, ""); //only load the actor model
+    }
 
     return 0;
 }
