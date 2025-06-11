@@ -14,6 +14,23 @@
 
 using namespace std;
 
+void print_tensor_inline(const std::string& name, const torch::Tensor& t, int precision = 4, int max_elements = 10) {
+    torch::Tensor flat = t.flatten().cpu();
+    std::cout << name << "=tensor([";
+    int64_t size = flat.size(0);
+    std::cout << std::fixed << std::setprecision(precision);
+    for (int64_t i = 0; i < std::min<int64_t>(size, max_elements / 2); ++i) {
+        std::cout << flat[i].item<double>() << ", ";
+    }
+    if (size > max_elements) {
+        std::cout << "...";
+        for (int64_t i = size - max_elements / 2; i < size; ++i) {
+            std::cout << ", " << flat[i].item<double>();
+        }
+    }
+    std::cout << "])" << std::endl << std::endl;
+}
+
 // Abstract environment interface
 class Env {
 public:
@@ -37,42 +54,162 @@ public:
     virtual Space action_space() const = 0;
 };
 
-class GymEnv : public Env {
+class CartPoleEnv : public Env {
+private:
+    float gravity = 9.8f;
+    float masscart = 1.0f;
+    float masspole = 0.1f;
+    float total_mass = masspole + masscart;
+    float length = 0.5f;  // half the pole's length
+    float polemass_length = masspole * length;
+    float force_mag = 10.0f;
+    float tau = 0.02f;
+    float theta_threshold_radians = 12 * 2 * M_PI / 360;
+    float x_threshold = 2.4f;
+
+    vector<float> state;
+    int steps_beyond_terminated = -1;
+    string integrator = "euler";
+
+    mt19937 rng;
+    uniform_real_distribution<float> dist{ -0.05f, 0.05f };
+
 public:
-    GymEnv(const string& env_name, const string& render_mode)
-        : env_name(env_name), render_mode(render_mode)
-    {
-        if (env_name == "Pendulum-v1") {
-            obs_space.shape = { 3 };  // [cos(theta), sin(theta), theta_dot]
-            act_space.shape = { 1 };  // torque
-            reset();
-        }
-        else {
-            throw runtime_error("Unsupported environment: " + env_name);
-        }
-        cout << "Created environment '" << env_name << "' with render mode '" << render_mode << "'\n";
+    CartPoleEnv() {
+        random_device rd;
+        rng = mt19937(rd());
+    }
+
+    Space observation_space() const override {
+        return Space{ {4} };
+    }
+
+    Space action_space() const override {
+        return Space{ {1} };  // Discrete(2)
     }
 
     pair<vector<float>, unordered_map<string, float>> reset() override {
-        theta = uniform(-M_PI, M_PI);
-        theta_dot = uniform(-1.0f, 1.0f);
+        state = { dist(rng), dist(rng), dist(rng), dist(rng) };
+        steps_beyond_terminated = -1;
+        return { state, {} };
+    }
+
+    tuple<vector<float>, float, bool, bool, unordered_map<string, float>> step(const vector<float>& action) override {
+        assert(action.size() == 1);
+
+        float x = state[0];
+        float x_dot = state[1];
+        float theta = state[2];
+        float theta_dot = state[3];
+
+        float force = 0.0f;
+        if (action[0] > 0)
+            force = force_mag;
+        else
+            force = -force_mag;
+
+        float costheta = cos(theta);
+        float sintheta = sin(theta);
+
+        float temp = (force + polemass_length * theta_dot * theta_dot * sintheta) / total_mass;
+        float thetaacc = (gravity * sintheta - costheta * temp) /
+            (length * (4.0f / 3.0f - masspole * costheta * costheta / total_mass));
+        float xacc = temp - polemass_length * thetaacc * costheta / total_mass;
+
+        if (integrator == "euler") {
+            x += tau * x_dot;
+            x_dot += tau * xacc;
+            theta += tau * theta_dot;
+            theta_dot += tau * thetaacc;
+        }
+        else {
+            x_dot += tau * xacc;
+            x += tau * x_dot;
+            theta_dot += tau * thetaacc;
+            theta += tau * theta_dot;
+        }
+
+        state = { x, x_dot, theta, theta_dot };
+
+        bool terminated = (x < -x_threshold || x > x_threshold ||
+            theta < -theta_threshold_radians || theta > theta_threshold_radians);
+
+        float reward = 0.0f;
+        if (!terminated) {
+            reward = 1.0f;
+        }
+        else if (steps_beyond_terminated == -1) {
+            steps_beyond_terminated = 0;
+            reward = 1.0f;
+        }
+        else {
+            if (steps_beyond_terminated == 0) {
+                // warn only once
+                printf("Warning: step() called after environment is terminated. Call reset().\n");
+            }
+            steps_beyond_terminated += 1;
+            reward = 0.0f;
+        }
+
+        return { state, reward, terminated, false, {} };
+    }
+
+    void render() override {
+        // Rendering can be implemented here using SDL2, SFML, OpenGL, or skipped.
+        printf("State: [%.3f, %.3f, %.3f, %.3f]\n", state[0], state[1], state[2], state[3]);
+    }
+};
+
+class PendulumEnv : public Env {
+public:
+    PendulumEnv(const string& render_mode = "", float gravity = 10.0f)
+        : g(gravity), render_mode(render_mode) {
+        max_speed = 8.0f;
+        max_torque = 2.0f;
+        dt = 0.05f;
+        m = 1.0f;
+        l = 1.0f;
+
+        obs_space.shape = { 3 };
+        act_space.shape = { 1 };
+
+        random_device rd;
+        rng = mt19937(rd());
+        dist = uniform_real_distribution<float>(-3.14f, 3.14f);
+    }
+
+    pair<vector<float>, unordered_map<string, float>> reset() override {
+        float theta = dist(rng);
+        float theta_dot = dist(rng) / 4.0f;
+        state = { theta, theta_dot };
+        last_u = 0.0f;
         return { get_obs(), {} };
     }
 
     tuple<vector<float>, float, bool, bool, unordered_map<string, float>> step(const vector<float>& action) override {
-        float torque = std::clamp(action[0], -max_torque, max_torque);
+        float u = clamp(action[0], -max_torque, max_torque);
+        last_u = u;
 
-        // physics
-        float new_theta_dot = theta_dot + (-3.0f * gravity / (2.0f * length) * sin(theta + M_PI) + 3.0f / (mass * length * length) * torque) * dt;
-        theta_dot = std::clamp(new_theta_dot, -max_speed, max_speed);
-        theta += theta_dot * dt;
+        float theta = state[0];
+        float theta_dot = state[1];
 
-        float cost = angle_normalize(theta) * angle_normalize(theta) + 0.1f * theta_dot * theta_dot + 0.001f * torque * torque;
+        float cost = angle_normalize(theta) * angle_normalize(theta)
+            + 0.1f * theta_dot * theta_dot
+            + 0.001f * u * u;
+
+        float new_theta_dot = theta_dot + (3.0f * g / (2.0f * l) * sin(theta) + 3.0f / (m * l * l) * u) * dt;
+        new_theta_dot = clamp(new_theta_dot, -max_speed, max_speed);
+        float new_theta = theta + new_theta_dot * dt;
+
+        state = { new_theta, new_theta_dot };
+
         return { get_obs(), -cost, false, false, {} };
     }
 
     void render() override {
-        cout << "Theta: " << theta << " | Theta_dot: " << theta_dot << "\n";
+        if (render_mode == "human") {
+            cout << "Angle: " << state[0] << ", Angular velocity: " << state[1] << ", Torque: " << last_u << "\n";
+        }
     }
 
     Space observation_space() const override {
@@ -84,41 +221,105 @@ public:
     }
 
 private:
-    string env_name;
+    float g, m, l, dt;
+    float max_speed, max_torque;
+    float last_u;
     string render_mode;
-    Space obs_space;
-    Space act_space;
+    vector<float> state;
+    Space obs_space, act_space;
 
-    float theta = 0.0f;
-    float theta_dot = 0.0f;
+    mt19937 rng;
+    uniform_real_distribution<float> dist;
 
-    const float max_torque = 2.0f;
-    const float max_speed = 8.0f;
-    const float dt = 0.05f;
-    const float gravity = 10.0f;
-    const float mass = 1.0f;
-    const float length = 1.0f;
-
-    vector<float> get_obs() {
+    vector<float> get_obs() const {
+        float theta = state[0];
+        float theta_dot = state[1];
         return { cos(theta), sin(theta), theta_dot };
     }
 
-    float uniform(float low, float high) {
-        return low + static_cast<float>(rand()) / RAND_MAX * (high - low);
+    float angle_normalize(float x) const {
+        return fmodf(x + M_PI, 2.0f * M_PI) - M_PI;
     }
 
-    float angle_normalize(float x) {
-        while (x > M_PI) x -= 2.0f * M_PI;
-        while (x < -M_PI) x += 2.0f * M_PI;
-        return x;
+    float clamp(float v, float lo, float hi) const {
+        return std::max(lo, std::min(v, hi));
+    }
+};
+
+class AgentTargetEnv : public Env {
+private:
+    float x_min = 0.0f, x_max = 10.0f;
+    float y_min = 0.0f, y_max = 10.0f;
+    float max_step = 0.5f;  // max movement per step in each axis
+
+    vector<float> agent_pos;  // {x, y}
+    vector<float> target_pos; // {x, y}
+
+    mt19937 rng;
+    uniform_real_distribution<float> dist_x;
+    uniform_real_distribution<float> dist_y;
+
+public:
+    AgentTargetEnv()
+        : dist_x(x_min, x_max), dist_y(y_min, y_max) {
+        random_device rd;
+        rng = mt19937(rd());
+    }
+
+    Space observation_space() const override {
+        // Observations: agent_x, agent_y, target_x, target_y
+        return Space{ {4} };
+    }
+
+    Space action_space() const override {
+        // Actions: continuous 2 floats, each in [-1, 1]
+        return Space{ {2} };
+    }
+
+    pair<vector<float>, unordered_map<string, float>> reset() override {
+        agent_pos = { dist_x(rng), dist_y(rng) };
+        target_pos = { dist_x(rng), dist_y(rng) };
+        return { get_observation(), {} };
+    }
+
+    tuple<vector<float>, float, bool, bool, unordered_map<string, float>> step(const vector<float>& action) override {
+        // Clip action to [-1,1]
+        float dx = max(-1.0f, min(1.0f, action[0])) * max_step;
+        float dy = max(-1.0f, min(1.0f, action[1])) * max_step;
+
+        // Update agent position and clip to bounds
+        agent_pos[0] = max(x_min, min(x_max, agent_pos[0] + dx));
+        agent_pos[1] = max(y_min, min(y_max, agent_pos[1] + dy));
+
+        // Distance to target
+        float dist_x = agent_pos[0] - target_pos[0];
+        float dist_y = agent_pos[1] - target_pos[1];
+        float distance = sqrt(dist_x * dist_x + dist_y * dist_y);
+
+        // Reward and done conditions
+        float reward = -0.01f * distance;
+        bool done = false;
+
+        if (distance < 1.0f) {
+            reward += 1.0f;
+            done = true;
+        }
+
+        return { get_observation(), reward, done, false, {} };
+    }
+
+    void render() override {
+        printf("Agent: (%.2f, %.2f), Target: (%.2f, %.2f)\n", agent_pos[0], agent_pos[1], target_pos[0], target_pos[1]);
+    }
+
+private:
+    vector<float> get_observation() const {
+        return { agent_pos[0], agent_pos[1], target_pos[0], target_pos[1] };
     }
 };
 
 
-
-/// <summary>
-
-/// </summary>
+///////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct FeedForwardNNImpl : torch::nn::Module {
     torch::nn::Linear layer1{ nullptr }, layer2{ nullptr }, layer3{ nullptr };
@@ -233,6 +434,15 @@ public:
             // Normalize advantages
             A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10);
 
+            ///TEMP
+            print_tensor_inline("batch_obs", batch_obs);
+            print_tensor_inline("batch_acts", batch_acts);
+            print_tensor_inline("batch_log_probs", batch_log_probs);
+            print_tensor_inline("batch_rtgs", batch_rtgs);
+            print_tensor_inline("batch_lengths", batch_lengths);
+            print_tensor_inline("V", V);
+            print_tensor_inline("A_k", A_k);
+
             // PPO update for multiple epochs
             for (int epoch = 0; epoch < n_updates_per_iteration; ++epoch) {
                 auto [V, curr_log_probs] = evaluate(batch_obs, batch_acts);
@@ -260,6 +470,15 @@ public:
 
                 // Logging actor loss
                 logger["actor_loss"] = actor_loss;
+
+                ///TEMP
+                print_tensor_inline("V", V);
+                print_tensor_inline("curr_log_probs", curr_log_probs);
+                print_tensor_inline("ratios", ratios);
+                print_tensor_inline("surr1", surr1);
+                print_tensor_inline("surr2", surr2);
+                print_tensor_inline("actor_loss", actor_loss);
+                print_tensor_inline("critic_loss", critic_loss);
             }
 
             // Print training summary
@@ -275,9 +494,9 @@ public:
 
     tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rollout() {
         // Batch data. For more details, check function header.
-        vector<vector<float>> batch_obs_vec;
+        vector<torch::Tensor> batch_obs_vec;
         vector<vector<float>> batch_acts_vec;
-        vector<float> batch_log_probs_vec;
+        vector<torch::Tensor> batch_log_probs_vec;
         vector<vector<float>> batch_rewards;
         vector<int> batch_lengths_vec;
 
@@ -305,12 +524,15 @@ public:
                 t += 1; // Increment timesteps ran this batch so far
 
                 // Track observations in this batch
-                batch_obs_vec.push_back(obs);
+
+                torch::Tensor obs_tensor = torch::from_blob((void*)obs.data(), { (int)obs.size() }, torch::kFloat).clone();
+                batch_obs_vec.push_back(obs_tensor);
 
                 // Calculate action and make a step in the env.
                 // Note that rew is short for reward.
-                auto [action, log_prob] = get_action(obs);
+                auto [action, log_prob] = get_action(obs_tensor);
                 auto [next_obs, rew, terminated, truncated, __] = env.step(action);
+                print_tensor_inline("log_prob", log_prob);
 
                 // Don't really care about the difference between terminated or truncated in this, so just combine them
                 done = terminated || truncated;
@@ -334,11 +556,17 @@ public:
         }
 
         // Reshape data as tensors in the shape specified in function description, before returning
-        torch::Tensor batch_obs = torch::from_blob(batch_obs_vec.data(), { (int)batch_obs_vec.size(), (int)batch_obs_vec[0].size() }, torch::kFloat).clone();
+        torch::Tensor batch_obs = torch::stack(batch_obs_vec).to(torch::kFloat);
         torch::Tensor batch_acts = torch::from_blob(batch_acts_vec.data(), { (int)batch_acts_vec.size(), (int)batch_acts_vec[0].size() }, torch::kFloat).clone();
         torch::Tensor batch_log_probs = torch::from_blob(batch_log_probs_vec.data(), { (int)batch_log_probs_vec.size() }, torch::kFloat).clone();
         torch::Tensor batch_rtgs = compute_rtgs(batch_rewards); // ALG STEP 4
         torch::Tensor batch_lengths = torch::tensor(batch_lengths_vec, torch::kInt64);
+
+        print_tensor_inline("batch_obs", batch_obs);
+        print_tensor_inline("batch_acts", batch_acts);
+        print_tensor_inline("batch_log_probs", batch_log_probs);
+        print_tensor_inline("batch_rtgs", batch_rtgs);
+        print_tensor_inline("batch_lengths", batch_lengths);
 
         // Log the episodic returns and episodic lengths in this batch.
         logger["batch_rewards"] = batch_rewards;
@@ -379,33 +607,29 @@ public:
         return torch::tensor(batch_rtgs, torch::kFloat);
     }
 
-    pair<vector<float>, float> get_action(const vector<float>& obs) {
-        /**
-            Queries an action from the actor network, should be called from rollout.
-
-            Parameters:
-                obs - the observation at the current timestep
-
-            Return:
-                action - the action to take, as a numpy array
-                log_prob - the log probability of the selected action in the distribution
-        */
-
+    pair<vector<float>, torch::Tensor> get_action(const torch::Tensor& obs_tensor) {
         // Query the actor network for a mean action
-        torch::Tensor obs_tensor = torch::from_blob((void*)obs.data(), { (int)obs.size() }, torch::kFloat).clone();
         torch::Tensor mean = actor->forward(obs_tensor);
 
-        // Create a distribution with the mean action and std from the covariance matrix above.
-        // For more information on how this distribution works, check out Andrew Ng's lecture on it:
-        // https://www.youtube.com/watch?v=JjB58InuTqM
-        torch::Tensor action_tensor = MultivariateNormal(mean, cov_mat).sample();
+        // Create a distribution with the mean action and std from the covariance matrix
+        auto dist = MultivariateNormal(mean, cov_mat);
+
+        // Sample an action from the distribution
+        torch::Tensor action_tensor = dist.sample();
 
         // Calculate the log probability for that action
-        torch::Tensor log_prob_tensor = MultivariateNormal(mean, cov_mat).log_prob(action_tensor);
+        torch::Tensor log_prob_tensor = dist.log_prob(action_tensor);
 
-        // Return the sampled action and the log probability of that action in our distribution
-        vector<float> action(action_tensor.data_ptr<float>(), action_tensor.data_ptr<float>() + action_tensor.numel());
-        return { action, log_prob_tensor.item<float>() };
+        print_tensor_inline("obs_tensor", obs_tensor);
+        print_tensor_inline("mean", mean);
+        print_tensor_inline("action_tensor", action_tensor);
+        print_tensor_inline("log_prob_tensor", log_prob_tensor);
+
+        // Detach before returning
+        vector<float> action(action_tensor.detach().data_ptr<float>(), action_tensor.detach().data_ptr<float>() + action_tensor.numel());
+        torch::Tensor log_prob_detached = log_prob_tensor.detach();
+
+        return { action, log_prob_detached };
     }
 
     pair<torch::Tensor, torch::Tensor> evaluate(const torch::Tensor& batch_obs, const torch::Tensor& batch_acts) {
@@ -462,7 +686,7 @@ private:
         clip = 0.2;                              // Recommended 0.2, helps define the threshold to clip the ratio during SGA
 
         // Miscellaneous parameters
-        render = true;                          // If we should render during rollout
+        render = false;                          // If we should render during rollout
         render_every_i = 10;                    // Only render every n iterations
         save_freq = 10;                         // How often we save in number of iterations
         seed = nullopt;                    // Sets the seed of our program, used for reproducibility of results
@@ -606,7 +830,7 @@ private:
 
 
 void train(
-    GymEnv& env,
+    Env& env,
     const unordered_map<string, float>& hyperparameters,
     const string& actor_model,
     const string& critic_model
@@ -645,7 +869,7 @@ void train(
     model.learn(200000000);
 }
 
-void test(GymEnv& env, const string& actor_model) {
+void test(Env& env, const string& actor_model) {
     /**
      * Tests the model.
      *
@@ -694,17 +918,25 @@ int main(int argc, char* argv[]) {
         {"n_updates_per_iteration", 10},
         {"lr", 3e-4},
         {"clip", 0.2},
-        {"render", 1},           // Using 1 for true
+        {"render", 0},           // Using 1 for true
         {"render_every_i", 10}
     };
 
-    GymEnv env("Pendulum-v1", (true) ? "human" : "rgb_array");
 
-    if (true) {
-        train(env, hyperparameters, "", "");
+    try {
+        PendulumEnv env;
+        if (true) {
+            train(env, hyperparameters, "", "");
+        }
+        else {
+            test(env, ""); // only load the actor model
+        }
     }
-    else {
-        test(env, ""); //only load the actor model
+    catch (const std::exception& e) {
+        std::cerr << "Exception occurred: " << e.what() << std::endl;
+    }
+    catch (...) {
+        std::cerr << "Unknown exception occurred." << std::endl;
     }
 
     return 0;

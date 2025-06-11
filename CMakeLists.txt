@@ -15,7 +15,7 @@ set(CAFFE2_USE_CUFILE 1)
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(Torch_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libtorch_d/share/cmake/Torch")
 else()
-    set(Torch_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libtorch_r/share/cmake/Torch")
+    set(Torch_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libtorch_d/share/cmake/Torch")
 endif()
 
 # Torch
