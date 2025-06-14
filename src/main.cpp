@@ -14,6 +14,8 @@
 
 using namespace std;
 
+torch::Device device;
+
 void print_tensor_inline(const std::string& name, const torch::Tensor& t, int precision = 4, int max_elements = 10) {
     //torch::Tensor flat = t.flatten().cpu();
     //std::cout << name << "=tensor([";
@@ -1031,8 +1033,39 @@ int main(int argc, char* argv[]) {
     };
 
 
+    std::cout << "LibTorch version: " << TORCH_VERSION << std::endl;
+
+    if (torch::cuda::is_available()) {
+        std::cout << "CUDA is available. GPU will be used.\n";
+        int deviceCount = 0;
+        cudaError_t err = cudaGetDeviceCount(&deviceCount);
+
+        if (err != cudaSuccess || deviceCount == 0) {
+            std::cout << "Failed to get CUDA device count or no devices found.\n";
+            return 1;
+        }
+
+        std::cout << "CUDA device count: " << deviceCount << "\n";
+
+        cudaDeviceProp deviceProp;
+        err = cudaGetDeviceProperties(&deviceProp, 0);
+        if (err == cudaSuccess) {
+            std::cout << "Current device name: " << deviceProp.name << "\n";
+        }
+        else {
+            std::cout << "Failed to get device properties.\n";
+        }
+
+        device = torch::Device(torch::kCUDA, 0);
+    }
+    else {
+        std::cout << "CUDA is NOT available. CPU will be used.\n";
+        device = torch::Device(torch::kCPU);
+    }
+
+
     try {
-        AgentTargetEnv env;
+        CartPoleEnv env;
         if (true) {
             train(env, hyperparameters, "", "");
         }
