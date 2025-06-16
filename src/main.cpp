@@ -702,16 +702,6 @@ public:
     }
 
     torch::Tensor compute_rtgs(const vector<vector<float>>& batch_rewards) {
-        /**
-            Compute the Reward-To-Go of each timestep in a batch given the rewards.
-
-            Parameters:
-                batch_rewards - the rewards in a batch, Shape: (number of episodes, number of timesteps per episode)
-
-            Return:
-                batch_rtgs - the rewards to go, Shape: (number of timesteps in batch)
-        */
-
         // The rewards-to-go (rtg) per episode per batch to return.
         // The shape will be (num timesteps per episode)
         vector<float> batch_rtgs;
@@ -758,21 +748,9 @@ public:
     }
 
     pair<torch::Tensor, torch::Tensor> evaluate(const torch::Tensor& batch_obs, const torch::Tensor& batch_acts) {
-        /**
-            Estimate the values of each observation, and the log probs of
-            each action in the most recent batch with the most recent
-            iteration of the actor network. Should be called from learn.
-
-            Parameters:
-                batch_obs - the observations from the most recently collected batch as a tensor.
-                            Shape: (number of timesteps in batch, dimension of observation)
-                batch_acts - the actions from the most recently collected batch as a tensor.
-                            Shape: (number of timesteps in batch, dimension of action)
-
-            Return:
-                V - the predicted values of batch_obs
-                log_probs - the log probabilities of the actions taken in batch_acts given batch_obs
-        */
+        //Estimate the values of each observation, and the log probs of
+        //each action in the most recent batch with the most recent
+        //iteration of the actor network. Should be called from learn.
 
         // Query critic network for a value V for each batch_obs. Shape of V should be same as batch_rtgs
         torch::Tensor V = critic->forward(batch_obs.to(device)).squeeze();
@@ -791,19 +769,7 @@ public:
 
 private:
     void _init_hyperparameters(const unordered_map<string, float>& hyperparameters) {
-        /**
-            Initialize default and custom values for hyperparameters
-
-            Parameters:
-                hyperparameters - the extra arguments included when creating the PPO model, should only include
-                                  hyperparameters defined below with custom values.
-
-            Return:
-                None
-        */
-
         // Initialize default values for hyperparameters
-        // Algorithm hyperparameters
         timesteps_per_batch = 4800;               // Number of timesteps to run per batch
         max_timesteps_per_episode = 1600;         // Max number of timesteps per episode
         n_updates_per_iteration = 5;              // Number of times to update actor/critic per iteration
@@ -962,18 +928,6 @@ void train(
     const string& actor_model,
     const string& critic_model
 ) {
-    /**
-     * Trains the model.
-     *
-     * Parameters:
-     *   env - the environment to train on
-     *   hyperparameters - map of hyperparameters
-     *   actor_model - path to actor model file if continuing training
-     *   critic_model - path to critic model file if continuing training
-     *
-     * Return:
-     *   None
-     */
     cout << "Training" << endl;
 
     PPO model(env, hyperparameters, device);  // Construct PPO with environment and hyperparameters
@@ -1063,7 +1017,7 @@ int main(int argc, char* argv[]) {
             std::cout << "Failed to get device properties.\n";
         }
 
-        //device = torch::Device(torch::kCUDA, 0);
+        device = torch::Device(torch::kCUDA, 0);
     }
     else {
         std::cout << "CUDA is NOT available. CPU will be used.\n";
@@ -1071,7 +1025,7 @@ int main(int argc, char* argv[]) {
 
 
     try {
-        CartPoleEnv env;
+        PendulumEnv env;
         if (true) {
             train(env, hyperparameters, device, "", "");
         }

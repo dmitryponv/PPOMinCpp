@@ -13,7 +13,7 @@ set(CAFFE2_USE_CUFILE 1)
 ################## TORCH DIR ################
 #############################################
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-    set(Torch_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libtorch_r/share/cmake/Torch")
+    set(Torch_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libtorch_d/share/cmake/Torch")
 else()
     set(Torch_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libtorch_r/share/cmake/Torch")
 endif()
@@ -32,16 +32,28 @@ set_property(TARGET PPOmin PROPERTY CXX_STANDARD 17)
 #############################################
 ############ COPY ONLY DLL FILES ############
 #############################################
-if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-    set(LIBTORCH_DLL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libtorch_r/lib")
-else()
-    set(LIBTORCH_DLL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libtorch_r/lib")
-endif()
+set(LIBTORCH_DLL_DIR_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/../libtorch_d/lib")
+set(LIBTORCH_DLL_DIR_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/../libtorch_r/lib")
 
-file(GLOB TORCH_DLLS "${LIBTORCH_DLL_DIR}/*.dll")
+file(GLOB TORCH_DLLS_DEBUG "${LIBTORCH_DLL_DIR_DEBUG}/*.dll")
+file(GLOB TORCH_DLLS_RELEASE "${LIBTORCH_DLL_DIR_RELEASE}/*.dll")
 
-add_custom_command(TARGET PPOmin POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    ${TORCH_DLLS}
-    $<TARGET_FILE_DIR:PPOmin>
-)
+# Define absolute destination folders
+set(DEST_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/build/Debug")
+set(DEST_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/build/Release")
+
+# Create destination directories
+file(MAKE_DIRECTORY "${DEST_DEBUG}")
+file(MAKE_DIRECTORY "${DEST_RELEASE}")
+
+# Copy Debug DLLs and print the command
+foreach(dll ${TORCH_DLLS_DEBUG})
+    message(STATUS "Copying ${dll} to ${DEST_DEBUG}")
+    execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${dll}" "${DEST_DEBUG}")
+endforeach()
+
+# Copy Release DLLs and print the command
+foreach(dll ${TORCH_DLLS_RELEASE})
+    message(STATUS "Copying ${dll} to ${DEST_RELEASE}")
+    execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${dll}" "${DEST_RELEASE}")
+endforeach()
