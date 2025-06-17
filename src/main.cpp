@@ -41,11 +41,10 @@ public:
     virtual ~Env() = default;
 
     // Reset the environment and return initial observation
-    virtual pair<vector<float>, unordered_map<string, float>> reset() = 0;
+    virtual pair<torch::Tensor, unordered_map<string, float>> reset() = 0;
 
-    // Step the environment with given action
-    // Returns: observation, reward, terminated flag, truncated flag, extra info
-    virtual tuple<vector<float>, float, bool, bool, unordered_map<string, float>> step(const vector<float>& action) = 0;
+    // Step the environment with given action returns: observation, reward, terminated flag, truncated flag, extra info
+    virtual tuple<torch::Tensor, float, bool, bool, unordered_map<string, float>> step(const torch::Tensor& action) = 0;
 
     virtual void render() = 0;
 
@@ -74,8 +73,10 @@ private:
     mt19937 rng;
     uniform_real_distribution<float> dist{ -0.05f, 0.05f };
 
+    torch::Device& mDevice;
+
 public:
-    CartPoleEnv() {
+    CartPoleEnv(torch::Device& device): mDevice(device) {
         random_device rd;
         rng = mt19937(rd());
     }
@@ -88,25 +89,23 @@ public:
         return Space{ {1} };  // Discrete(2)
     }
 
-    pair<vector<float>, unordered_map<string, float>> reset() override {
+    pair<torch::Tensor, unordered_map<string, float>> reset() override {
         state = { dist(rng), dist(rng), dist(rng), dist(rng) };
         steps_beyond_terminated = -1;
-        return { state, {} };
+        torch::Tensor state_tensor = torch::tensor(state).to(mDevice);
+        return { state_tensor, {} };
     }
 
-    tuple<vector<float>, float, bool, bool, unordered_map<string, float>> step(const vector<float>& action) override {
-        assert(action.size() == 1);
+    tuple<torch::Tensor, float, bool, bool, unordered_map<string, float>> step(const torch::Tensor& action) override {
+        assert(action.numel() == 1);
+        float action_value = action.item<float>();
 
         float x = state[0];
         float x_dot = state[1];
         float theta = state[2];
         float theta_dot = state[3];
 
-        float force = 0.0f;
-        if (action[0] > 0)
-            force = force_mag;
-        else
-            force = -force_mag;
+        float force = (action_value > 0) ? force_mag : -force_mag;
 
         float costheta = cos(theta);
         float sintheta = sin(theta);
@@ -144,14 +143,14 @@ public:
         }
         else {
             if (steps_beyond_terminated == 0) {
-                // warn only once
                 printf("Warning: step() called after environment is terminated. Call reset().\n");
             }
             steps_beyond_terminated += 1;
             reward = 0.0f;
         }
 
-        return { state, reward, terminated, false, {} };
+        torch::Tensor next_state = torch::tensor({ x, x_dot, theta, theta_dot }).to(mDevice);
+        return { next_state, reward, terminated, false, {} };
     }
 
     void render() override {
@@ -162,8 +161,8 @@ public:
 
 class PendulumEnv : public Env {
 public:
-    PendulumEnv(const string& render_mode = "", float gravity = 10.0f)
-        : g(gravity), render_mode(render_mode) {
+    PendulumEnv(torch::Device& device, const string& render_mode = "", float gravity = 10.0f)
+        : mDevice(device), g(gravity), render_mode(render_mode) {
         max_speed = 8.0f;
         max_torque = 2.0f;
         dt = 0.05f;
@@ -178,7 +177,7 @@ public:
         dist = uniform_real_distribution<float>(-3.14f, 3.14f);
     }
 
-    pair<vector<float>, unordered_map<string, float>> reset() override {
+    pair<torch::Tensor, unordered_map<string, float>> reset() override {
         float theta = dist(rng);
         float theta_dot = dist(rng) / 4.0f;
         state = { theta, theta_dot };
@@ -186,8 +185,8 @@ public:
         return { get_obs(), {} };
     }
 
-    tuple<vector<float>, float, bool, bool, unordered_map<string, float>> step(const vector<float>& action) override {
-        float u = clamp(action[0], -max_torque, max_torque);
+    tuple<torch::Tensor, float, bool, bool, unordered_map<string, float>> step(const torch::Tensor& action) override {
+        float u = std::clamp(action.item<float>(), -max_torque, max_torque);
         last_u = u;
 
         float theta = state[0];
@@ -197,8 +196,8 @@ public:
             + 0.1f * theta_dot * theta_dot
             + 0.001f * u * u;
 
-        float new_theta_dot = theta_dot + (3.0f * g / (2.0f * l) * sin(theta) + 3.0f / (m * l * l) * u) * dt;
-        new_theta_dot = clamp(new_theta_dot, -max_speed, max_speed);
+        float new_theta_dot = theta_dot + (3.0f * g / (2.0f * l) * std::sin(theta) + 3.0f / (m * l * l) * u) * dt;
+        new_theta_dot = std::clamp(new_theta_dot, -max_speed, max_speed);
         float new_theta = theta + new_theta_dot * dt;
 
         state = { new_theta, new_theta_dot };
@@ -221,6 +220,7 @@ public:
     }
 
 private:
+    torch::Device& mDevice;
     float g, m, l, dt;
     float max_speed, max_torque;
     float last_u;
@@ -231,10 +231,10 @@ private:
     mt19937 rng;
     uniform_real_distribution<float> dist;
 
-    vector<float> get_obs() const {
+    torch::Tensor get_obs() const {
         float theta = state[0];
         float theta_dot = state[1];
-        return { cos(theta), sin(theta), theta_dot };
+        return torch::tensor({ std::cos(theta), std::sin(theta), theta_dot }).to(mDevice);
     }
 
     float angle_normalize(float x) const {
@@ -260,8 +260,8 @@ private:
     uniform_real_distribution<float> dist_y;
 
 public:
-    AgentTargetEnv()
-        : dist_x(x_min, x_max), dist_y(y_min, y_max) {
+    AgentTargetEnv(torch::Device& device)
+        : mDevice(device), dist_x(x_min, x_max), dist_y(y_min, y_max) {
         random_device rd;
         rng = mt19937(rd());
     }
@@ -276,25 +276,25 @@ public:
         return Space{ {2} };
     }
 
-    pair<vector<float>, unordered_map<string, float>> reset() override {
+    pair<torch::Tensor, unordered_map<string, float>> reset() override {
         agent_pos = { dist_x(rng), dist_y(rng) };
         target_pos = { dist_x(rng), dist_y(rng) };
         return { get_observation(), {} };
     }
 
-    tuple<vector<float>, float, bool, bool, unordered_map<string, float>> step(const vector<float>& action) override {
-        // Clip action to [-1,1]
-        float dx = max(-1.0f, min(1.0f, action[0])) * max_step;
-        float dy = max(-1.0f, min(1.0f, action[1])) * max_step;
+    tuple<torch::Tensor, float, bool, bool, unordered_map<string, float>> step(const torch::Tensor& action) override {
+        // Clip action to [-1, 1]
+        float dx = std::clamp(action[0].item<float>(), -1.0f, 1.0f) * max_step;
+        float dy = std::clamp(action[1].item<float>(), -1.0f, 1.0f) * max_step;
 
         // Update agent position and clip to bounds
-        agent_pos[0] = max(x_min, min(x_max, agent_pos[0] + dx));
-        agent_pos[1] = max(y_min, min(y_max, agent_pos[1] + dy));
+        agent_pos[0] = std::clamp(agent_pos[0] + dx, x_min, x_max);
+        agent_pos[1] = std::clamp(agent_pos[1] + dy, y_min, y_max);
 
         // Distance to target
         float dist_x = agent_pos[0] - target_pos[0];
         float dist_y = agent_pos[1] - target_pos[1];
-        float distance = sqrt(dist_x * dist_x + dist_y * dist_y);
+        float distance = std::sqrt(dist_x * dist_x + dist_y * dist_y);
 
         // Reward and done conditions
         float reward = -0.01f * distance;
@@ -313,11 +313,12 @@ public:
     }
 
 private:
-    vector<float> get_observation() const {
-        return { agent_pos[0], agent_pos[1], target_pos[0], target_pos[1] };
+    torch::Device& mDevice;
+
+    torch::Tensor get_observation() const {
+        return torch::tensor({ agent_pos[0], agent_pos[1], target_pos[0], target_pos[1] }).to(mDevice);
     }
 };
-
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
 
 class MultivariateNormal {
@@ -349,8 +350,8 @@ public:
                 throw std::invalid_argument("scale_tril must be at least two-dimensional.");
             }
             auto bshape = broadcast_shapes(scale_tril->sizes().vec(), loc.sizes().vec(), 2, 1);
-            scale_tril_ = scale_tril/*->to(device)*/->expand(bshape).contiguous();
-            _unbroadcasted_scale_tril = *scale_tril/*->to(device)*/;
+            scale_tril_ = scale_tril->expand(bshape).contiguous();
+            _unbroadcasted_scale_tril = *scale_tril;
             batch_shape = std::vector<int64_t>(bshape.begin(), bshape.end() - 2);
         }
         else if (covariance_matrix.has_value()) {
@@ -358,8 +359,8 @@ public:
                 throw std::invalid_argument("covariance_matrix must be at least two-dimensional.");
             }
             auto bshape = broadcast_shapes(covariance_matrix->sizes().vec(), loc.sizes().vec(), 2, 1);
-            covariance_matrix_ = covariance_matrix/*->to(device)*/->expand(bshape).contiguous();
-            _unbroadcasted_scale_tril = torch::linalg_cholesky(*covariance_matrix/*->to(device)*/);
+            covariance_matrix_ = covariance_matrix->expand(bshape).contiguous();
+            _unbroadcasted_scale_tril = torch::linalg_cholesky(*covariance_matrix);
             batch_shape = std::vector<int64_t>(bshape.begin(), bshape.end() - 2);
         }
         else {
@@ -367,14 +368,14 @@ public:
                 throw std::invalid_argument("precision_matrix must be at least two-dimensional.");
             }
             auto bshape = broadcast_shapes(precision_matrix->sizes().vec(), loc.sizes().vec(), 2, 1);
-            precision_matrix_ = precision_matrix/*->to(device)*/->expand(bshape).contiguous();
-            _unbroadcasted_scale_tril = torch::linalg_cholesky(torch::linalg_inv(*precision_matrix/*->to(device)*/));
+            precision_matrix_ = precision_matrix->expand(bshape).contiguous();
+            _unbroadcasted_scale_tril = torch::linalg_cholesky(torch::linalg_inv(*precision_matrix));
             batch_shape = std::vector<int64_t>(bshape.begin(), bshape.end() - 2);
         }
 
         auto expanded_shape = batch_shape;
         expanded_shape.push_back(loc.size(-1));
-        this->loc = loc/*.to(device)*/.expand(expanded_shape).contiguous();
+        this->loc = loc.expand(expanded_shape).contiguous();
         event_shape = { loc.size(-1) };
     }
 
@@ -463,18 +464,15 @@ private:
 struct FeedForwardNNImpl : torch::nn::Module {
     torch::nn::Linear layer1{ nullptr }, layer2{ nullptr }, layer3{ nullptr };
 
-    //torch::Device kDevice;
-
     FeedForwardNNImpl(int in_dim, int out_dim, torch::Device& device) {
-        //kDevice = device;
         
         layer1 = register_module("layer1", torch::nn::Linear(in_dim, 64));
         layer2 = register_module("layer2", torch::nn::Linear(64, 64));
         layer3 = register_module("layer3", torch::nn::Linear(64, out_dim));
 
-        //layer1/*->to(device)*/;
-        //layer2/*->to(device)*/;
-        //layer3/*->to(device)*/;
+        layer1->to(device);
+        layer2->to(device);
+        layer3->to(device);
     }
 
     torch::Tensor forward(torch::Tensor obs) {
@@ -494,12 +492,23 @@ TORCH_MODULE(FeedForwardNN);
 
 class PPO {
 public:
-    FeedForwardNN actor = nullptr;
-    FeedForwardNN critic = nullptr;
-    torch::Device device;
 
-    PPO(Env& env, const std::unordered_map<std::string, float>& hyperparameters, torch::Device& device)
+    PPO(Env& env, const std::unordered_map<std::string, float>& hyperparameters, torch::Device& device, string actor_model = "", string critic_model = "")
         : env(env), device(device) {
+
+        if (!actor_model.empty() && !critic_model.empty()) {
+            cout << "Loading in " << actor_model << " and " << critic_model << "..." << endl;
+            torch::load(actor, actor_model);
+            torch::load(critic, critic_model);
+            cout << "Successfully loaded." << endl;
+        }
+        else if (!actor_model.empty() || !critic_model.empty()) {
+            cerr << "Error: Actor and Critic models must be Specified or Empty" << endl;
+            exit(0);
+        }
+        else {
+            cout << "Training from scratch." << endl;
+        }
 
         _init_hyperparameters(hyperparameters);
 
@@ -512,7 +521,7 @@ public:
         actor_optim = std::make_unique<torch::optim::Adam>(actor->parameters(), torch::optim::AdamOptions(lr));
         critic_optim = std::make_unique<torch::optim::Adam>(critic->parameters(), torch::optim::AdamOptions(lr));
 
-        cov_var = torch::full({ act_dim }, 0.5)/*.to(device)*/;
+        cov_var = torch::full({ act_dim }, 0.5).to(device);
         cov_mat = cov_var.diag();
 
         logger["delta_t"] = std::chrono::high_resolution_clock::now().time_since_epoch().count();
@@ -531,20 +540,21 @@ public:
 
         while (t_so_far < total_timesteps) {
             // ALG STEP 2-3: Rollout to collect a batch of trajectories
-            auto [batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_lengths] = rollout();
-
-            // Move batches to the same device
-            batch_obs = batch_obs/*.to(device)*/;
-            batch_acts = batch_acts/*.to(device)*/;
-            batch_log_probs = batch_log_probs/*.to(device)*/;
-            batch_rtgs = batch_rtgs/*.to(device)*/;
-            batch_lengths = batch_lengths/*.to(device)*/;
+            auto [batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_lengths] = rollout_train();
 
             // Count how many timesteps we collected
             t_so_far += batch_lengths.sum().item<int>();
 
             // Count iterations
             i_so_far += 1;
+
+
+            //Update learning rate 
+            float frac = (t_so_far - 1.0f) / total_timesteps;
+            float new_lr = lr * (1.0f - frac);
+            new_lr = std::max(new_lr, 0.0f);
+            actor_optim->param_groups()[0].options().set_lr(new_lr);
+            critic_optim->param_groups()[0].options().set_lr(new_lr);
 
             // Logging
             logger["t_so_far"] = t_so_far;
@@ -604,168 +614,22 @@ public:
                 print_tensor_inline("surr2", surr2);
                 print_tensor_inline("actor_loss", actor_loss);
                 print_tensor_inline("critic_loss", critic_loss);
-            }
 
+            }
             // Print training summary
-            _log_summary();
+            _log_train();
 
             // Save model
             if (i_so_far % save_freq == 0) {
-                torch::save(actor, "./ppo_actor.pt");
-                torch::save(critic, "./ppo_critic.pt");
-            }
-        }
-    }
-
-    tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rollout() {
-        // Batch data. For more details, check function header.
-        vector<torch::Tensor> batch_obs_vec;
-        vector<torch::Tensor> batch_acts_vec;
-        vector<torch::Tensor> batch_log_probs_vec;
-        vector<vector<float>> batch_rewards;
-        vector<int> batch_lengths_vec;
-
-        // Episodic data. Keeps track of rewards per episode, will get cleared
-        // upon each new episode
-        vector<float> ep_rews;
-
-        int t = 0; // Keeps track of how many timesteps we've run so far this batch
-
-        // Keep simulating until we've run more than or equal to specified timesteps per batch
-        while (t < timesteps_per_batch) {
-            ep_rews.clear(); // rewards collected per episode
-
-            // Reset the environment. Note that obs is short for observation.
-            auto [obs, _] = env.reset();
-            bool done = false;
-
-            // Run an episode for a maximum of max_timesteps_per_episode timesteps
-            for (int ep_t = 0; ep_t < max_timesteps_per_episode; ++ep_t) {
-                // If render is specified, render the environment
-                if (render && (std::get<int>(logger["i_so_far"]) % render_every_i == 0) && batch_lengths_vec.empty()) {
-                    env.render();
+                if (!std::filesystem::exists("./models")) {
+                    std::filesystem::create_directories("./models");
                 }
-
-                t += 1; // Increment timesteps ran this batch so far
-
-                // Track observations in this batch
-
-                torch::Tensor obs_tensor = torch::from_blob((void*)obs.data(), { (int)obs.size() }, torch::kFloat).clone()/*.to(device)*/;
-                batch_obs_vec.push_back(obs_tensor);
-
-                // Calculate action and make a step in the env.
-                // Note that rew is short for reward.
-                auto [action, log_prob] = get_action(obs_tensor);
-                torch::Tensor action_tensor = torch::from_blob((void*)action.data(), { (int)action.size() }, torch::kFloat).clone()/*.to(device)*/;
-                auto [next_obs, rew, terminated, truncated, __] = env.step(action);
-                print_tensor_inline("log_prob", log_prob/*.to(device)*/);
-
-                // Don't really care about the difference between terminated or truncated in this, so just combine them
-                done = terminated || truncated;
-
-                // Track recent reward, action, and action log probability
-                ep_rews.push_back(rew);
-                batch_acts_vec.push_back(action_tensor);
-                batch_log_probs_vec.push_back(log_prob/*.to(device)*/);
-
-                obs = next_obs;
-
-                // If the environment tells us the episode is terminated, break
-                if (done) {
-                    break;
-                }
-            }
-
-            // Track episodic lengths and rewards
-            batch_lengths_vec.push_back(ep_rews.size());
-            batch_rewards.push_back(ep_rews);
-        }
-
-        // Reshape data as tensors in the shape specified in function description, before returning
-        torch::Tensor batch_obs = torch::stack(batch_obs_vec).to(torch::kFloat)/*.to(device)*/;
-        torch::Tensor batch_acts = torch::stack(batch_acts_vec).to(torch::kFloat)/*.to(device)*/;
-        torch::Tensor batch_log_probs = torch::stack(batch_log_probs_vec).to(torch::kFloat)/*.to(device)*/;
-        torch::Tensor batch_rtgs = compute_rtgs(batch_rewards)/*.to(device)*/; // ALG STEP 4
-        torch::Tensor batch_lengths = torch::tensor(batch_lengths_vec, torch::kInt64)/*.to(device)*/;
-
-        print_tensor_inline("batch_obs", batch_obs);
-        print_tensor_inline("batch_acts", batch_acts);
-        print_tensor_inline("batch_log_probs", batch_log_probs);
-        print_tensor_inline("batch_rtgs", batch_rtgs);
-        print_tensor_inline("batch_lengths", batch_lengths);
-
-        // Log the episodic returns and episodic lengths in this batch.
-        logger["batch_rewards"] = batch_rewards;
-        logger["batch_lengths"] = batch_lengths_vec;
-
-        return { batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_lengths };
-    }
-
-    torch::Tensor compute_rtgs(const vector<vector<float>>& batch_rewards) {
-        // The rewards-to-go (rtg) per episode per batch to return.
-        // The shape will be (num timesteps per episode)
-        vector<float> batch_rtgs;
-
-        // Iterate through each episode
-        for (auto it = batch_rewards.rbegin(); it != batch_rewards.rend(); ++it) {
-            const auto& ep_rews = *it;
-            float discounted_reward = 0; // The discounted reward so far
-
-            // Iterate through all rewards in the episode. We go backwards for smoother calculation of each
-            // discounted return (think about why it would be harder starting from the beginning)
-            for (auto rit = ep_rews.rbegin(); rit != ep_rews.rend(); ++rit) {
-                discounted_reward = *rit + discounted_reward * gamma;
-                batch_rtgs.insert(batch_rtgs.begin(), discounted_reward);
+                std::cout << "Saving training model as /models/ppo_actor.pt" << std::endl;
+                torch::save(actor, "./models/ppo_actor.pt");
+                torch::save(critic, "./models/ppo_critic.pt");
             }
         }
-
-        // Convert the rewards-to-go into a tensor
-        return torch::tensor(batch_rtgs, torch::kFloat)/*.to(device)*/;
     }
-
-    pair<vector<float>, torch::Tensor> get_action(const torch::Tensor& obs_tensor) {
-        // Query the actor network for a mean action
-        torch::Tensor mean = actor->forward(obs_tensor/*.to(device)*/);
-
-        // Create a distribution with the mean action and std from the covariance matrix
-        auto dist = MultivariateNormal(mean, cov_mat);
-
-        // Sample an action from the distribution
-        torch::Tensor action_tensor = dist.sample();
-
-        // Calculate the log probability for that action
-        torch::Tensor log_prob_tensor = dist.log_prob(action_tensor);
-
-        print_tensor_inline("obs_tensor", obs_tensor/*.to(device)*/);
-        print_tensor_inline("mean", mean);
-        print_tensor_inline("action_tensor", action_tensor);
-        print_tensor_inline("log_prob_tensor", log_prob_tensor);
-
-        // Detach before returning
-        vector<float> action(action_tensor.detach().data_ptr<float>(), action_tensor.detach().data_ptr<float>() + action_tensor.numel());
-
-        return { action, log_prob_tensor.detach()/*.to(device)*/ };
-    }
-
-    pair<torch::Tensor, torch::Tensor> evaluate(const torch::Tensor& batch_obs, const torch::Tensor& batch_acts) {
-        //Estimate the values of each observation, and the log probs of
-        //each action in the most recent batch with the most recent
-        //iteration of the actor network. Should be called from learn.
-
-        // Query critic network for a value V for each batch_obs. Shape of V should be same as batch_rtgs
-        torch::Tensor V = critic->forward(batch_obs).squeeze();
-
-        // Calculate the log probabilities of batch actions using most recent actor network.
-        // This segment of code is similar to that in get_action()
-        torch::Tensor mean = actor->forward(batch_obs);
-        MultivariateNormal dist(mean, cov_mat);
-        torch::Tensor log_probs = (dist.log_prob(batch_acts))/*.to(device)*/;
-
-        // Return the value vector V of each observation in the batch
-        // and log probabilities log_probs of each action in the batch
-        return { V, log_probs };
-    }
-
 
 private:
     void _init_hyperparameters(const unordered_map<string, float>& hyperparameters) {
@@ -806,7 +670,7 @@ private:
         }
     }
 
-    void _log_summary() {
+    void _log_train() {
         try {
             long long prev_delta_t = std::get<long long>(logger["delta_t"]);
             logger["delta_t"] = chrono::duration_cast<chrono::nanoseconds>(
@@ -878,6 +742,149 @@ private:
         }
     }
 
+    torch::Tensor compute_rtgs(const vector<vector<float>>& batch_rewards) {
+        // The rewards-to-go (rtg) per episode per batch to return.
+        // The shape will be (num timesteps per episode)
+        vector<float> batch_rtgs;
+
+        // Iterate through each episode
+        for (auto it = batch_rewards.rbegin(); it != batch_rewards.rend(); ++it) {
+            const auto& ep_rews = *it;
+            float discounted_reward = 0; // The discounted reward so far
+
+            // Iterate through all rewards in the episode. We go backwards for smoother calculation of each
+            // discounted return (think about why it would be harder starting from the beginning)
+            for (auto rit = ep_rews.rbegin(); rit != ep_rews.rend(); ++rit) {
+                discounted_reward = *rit + discounted_reward * gamma;
+                batch_rtgs.insert(batch_rtgs.begin(), discounted_reward);
+            }
+        }
+
+        // Convert the rewards-to-go into a tensor
+        return torch::tensor(batch_rtgs, torch::kFloat).to(device);
+    }
+
+    pair<torch::Tensor, torch::Tensor> get_action(const torch::Tensor& obs_tensor) {
+        // Query the actor network for a mean action
+        torch::Tensor mean = actor->forward(obs_tensor);
+
+        // Create a distribution with the mean action and std from the covariance matrix
+        auto dist = MultivariateNormal(mean, cov_mat);
+
+        // Sample an action from the distribution
+        torch::Tensor action_tensor = dist.sample();
+
+        // Calculate the log probability for that action
+        torch::Tensor log_prob_tensor = dist.log_prob(action_tensor);
+
+        print_tensor_inline("obs_tensor", obs_tensor);
+        print_tensor_inline("mean", mean);
+        print_tensor_inline("action_tensor", action_tensor);
+        print_tensor_inline("log_prob_tensor", log_prob_tensor);
+
+        return { action_tensor, log_prob_tensor.detach() };
+    }
+
+    pair<torch::Tensor, torch::Tensor> evaluate(const torch::Tensor& batch_obs, const torch::Tensor& batch_acts) {
+        //Estimate the values of each observation, and the log probs of
+        //each action in the most recent batch with the most recent
+        //iteration of the actor network. Should be called from learn.
+
+        // Query critic network for a value V for each batch_obs. Shape of V should be same as batch_rtgs
+        torch::Tensor V = critic->forward(batch_obs).squeeze();
+
+        // Calculate the log probabilities of batch actions using most recent actor network.
+        // This segment of code is similar to that in get_action()
+        torch::Tensor mean = actor->forward(batch_obs);
+        MultivariateNormal dist(mean, cov_mat);
+        torch::Tensor log_probs = (dist.log_prob(batch_acts));
+
+        // Return the value vector V of each observation in the batch
+        // and log probabilities log_probs of each action in the batch
+        return { V, log_probs };
+    }
+
+    tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rollout_train() {
+        // Batch data. For more details, check function header.
+        vector<torch::Tensor> batch_obs_vec;
+        vector<torch::Tensor> batch_acts_vec;
+        vector<torch::Tensor> batch_log_probs_vec;
+        vector<vector<float>> batch_rewards;
+        vector<int> batch_lengths_vec;
+
+        // Episodic data. Keeps track of rewards per episode, will get cleared
+        // upon each new episode
+        vector<float> ep_rews;
+
+        int t = 0; // Keeps track of how many timesteps we've run so far this batch
+
+        // Keep simulating until we've run more than or equal to specified timesteps per batch
+        while (t < timesteps_per_batch) {
+            ep_rews.clear(); // rewards collected per episode
+
+            // Reset the environment. Note that obs is short for observation.
+            auto [obs_tensor, _] = env.reset();
+            bool done = false;
+
+            // Run an episode for a maximum of max_timesteps_per_episode timesteps
+            for (int ep_t = 0; ep_t < max_timesteps_per_episode; ++ep_t) {
+                // If render is specified, render the environment
+                if (render && (std::get<int>(logger["i_so_far"]) % render_every_i == 0) && batch_lengths_vec.empty()) {
+                    env.render();
+                }
+
+                t += 1; // Increment timesteps ran this batch so far
+
+                // Track observations in this batch
+                batch_obs_vec.push_back(obs_tensor);
+
+                // Calculate action and make a step in the env.
+                // Note that rew is short for reward.
+                auto [action_tensor, log_prob] = get_action(obs_tensor);
+                auto [next_obs, rew, terminated, truncated, __] = env.step(action_tensor);
+                print_tensor_inline("log_prob", log_prob);
+
+                // Don't really care about the difference between terminated or truncated in this, so just combine them
+                done = terminated || truncated;
+
+                // Track recent reward, action, and action log probability
+                ep_rews.push_back(rew);
+                batch_acts_vec.push_back(action_tensor);
+                batch_log_probs_vec.push_back(log_prob);
+
+                obs_tensor = next_obs;
+
+                // If the environment tells us the episode is terminated, break
+                if (done) {
+                    break;
+                }
+            }
+
+            // Track episodic lengths and rewards
+            batch_lengths_vec.push_back(ep_rews.size());
+            batch_rewards.push_back(ep_rews);
+        }
+
+        // Reshape data as tensors in the shape specified in function description, before returning
+        torch::Tensor batch_obs = torch::stack(batch_obs_vec).to(torch::kFloat);
+        torch::Tensor batch_acts = torch::stack(batch_acts_vec).to(torch::kFloat);
+        torch::Tensor batch_log_probs = torch::stack(batch_log_probs_vec).to(torch::kFloat);
+        torch::Tensor batch_rtgs = compute_rtgs(batch_rewards); // ALG STEP 4
+        torch::Tensor batch_lengths = torch::tensor(batch_lengths_vec, torch::kInt64);
+
+        print_tensor_inline("batch_obs", batch_obs);
+        print_tensor_inline("batch_acts", batch_acts);
+        print_tensor_inline("batch_log_probs", batch_log_probs);
+        print_tensor_inline("batch_rtgs", batch_rtgs);
+        print_tensor_inline("batch_lengths", batch_lengths);
+
+        // Log the episodic returns and episodic lengths in this batch.
+        logger["batch_rewards"] = batch_rewards;
+        logger["batch_lengths"] = batch_lengths_vec;
+
+        return { batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_lengths };
+    }
+
     Env& env;
     int obs_dim;
     int act_dim;
@@ -885,7 +892,10 @@ private:
 
     torch::Tensor cov_var;
     torch::Tensor cov_mat;
-
+    
+    FeedForwardNN actor = nullptr;
+    FeedForwardNN critic = nullptr;
+    torch::Device device;
 
     unique_ptr<torch::optim::Adam> actor_optim;
     unique_ptr<torch::optim::Adam> critic_optim;
@@ -920,6 +930,104 @@ private:
     optional<int> seed;
 };
 
+class PPO_Eval {
+public:
+    PPO_Eval(Env& env, torch::Device& device, string actor_model = "")
+        : env(env), device(device) {
+
+        if (actor_model.empty()) {
+            cerr << "No actor model file. Exiting." << endl;
+            exit(0);
+        }
+
+
+        obs_dim = env.observation_space().shape[0];
+        act_dim = env.action_space().shape[0];
+
+        actor = FeedForwardNN(obs_dim, act_dim, device);
+
+        torch::load(actor, actor_model);
+
+        cov_mat = torch::full({ act_dim }, 0.5).to(device).diag();
+    }
+
+    void eval_policy(bool render = false) {
+        int ep_num = 0;
+
+        while (true) {
+            auto [obs_tensor, _] = env.reset();
+            bool done = false;
+
+            int t = 0;
+            float ep_len = 0.0f;
+            float ep_ret = 0.0f;
+
+            while (!done) {
+                t++;
+
+                if (render) {
+                    env.render();
+                }
+                auto [action_tensor, log_prob] = get_action(obs_tensor);
+                auto [next_obs, rew, terminated, truncated, __] = env.step(action_tensor);
+                done = terminated || truncated;
+
+                ep_ret += rew;
+                obs_tensor = next_obs;
+            }
+
+            ep_len = static_cast<float>(t);
+
+            log_eval(ep_len, ep_ret, ep_num);
+            ep_num++;
+        }
+    }
+
+private:
+
+    pair<torch::Tensor, torch::Tensor> get_action(const torch::Tensor& obs_tensor) {
+        // Query the actor network for a mean action
+        torch::Tensor mean = actor->forward(obs_tensor);
+
+        // Create a distribution with the mean action and std from the covariance matrix
+        auto dist = MultivariateNormal(mean, cov_mat);
+
+        // Sample an action from the distribution
+        torch::Tensor action_tensor = dist.sample();
+
+        // Calculate the log probability for that action
+        torch::Tensor log_prob_tensor = dist.log_prob(action_tensor);
+
+        print_tensor_inline("obs_tensor", obs_tensor);
+        print_tensor_inline("mean", mean);
+        print_tensor_inline("action_tensor", action_tensor);
+        print_tensor_inline("log_prob_tensor", log_prob_tensor);
+
+        return { action_tensor, log_prob_tensor.detach() };
+    }
+
+    void log_eval(float ep_len, float ep_ret, int ep_num) {
+        // Round decimals for nicer output
+        ep_len = std::round(ep_len * 100.0f) / 100.0f;
+        ep_ret = std::round(ep_ret * 100.0f) / 100.0f;
+
+        std::cout << std::endl;
+        std::cout << "-------------------- Episode #" << ep_num << " --------------------" << std::endl;
+        std::cout << "Episodic Length: " << ep_len << std::endl;
+        std::cout << "Episodic Return: " << ep_ret << std::endl;
+        std::cout << "------------------------------------------------------" << std::endl;
+        std::cout << std::endl;
+        std::cout.flush();
+    }
+
+    FeedForwardNN actor = nullptr;
+    torch::Device device;
+    Env& env;
+    int obs_dim;
+    int act_dim;
+    torch::Tensor cov_mat;
+};
+
 
 void train(
     Env& env,
@@ -930,52 +1038,18 @@ void train(
 ) {
     cout << "Training" << endl;
 
-    PPO model(env, hyperparameters, device);  // Construct PPO with environment and hyperparameters
-
-    if (!actor_model.empty() && !critic_model.empty()) {
-        cout << "Loading in " << actor_model << " and " << critic_model << "..." << endl;
-        torch::load(model.actor, actor_model);
-        torch::load(model.critic, critic_model);
-        cout << "Successfully loaded." << endl;
-    }
-    else if (!actor_model.empty() || !critic_model.empty()) {
-        cerr << "Error: Either specify both actor/critic models or none at all. We don't want to accidentally override anything!" << endl;
-        exit(0);
-    }
-    else {
-        cout << "Training from scratch." << endl;
-    }
+    PPO model(env, hyperparameters, device, actor_model, critic_model);  // Construct PPO with environment and hyperparameters
 
     // Train PPO model for a large number of timesteps
     model.learn(200000000);
 }
 
-void test(Env& env, torch::Device& device, const string& actor_model) {
-    /**
-     * Tests the model.
-     *
-     * Parameters:
-     *   env - the environment to test on
-     *   actor_model - path to actor model file
-     *
-     * Return:
-     *   None
-     */
+void eval(Env& env, torch::Device& device, const string& actor_model) {
     cout << "Testing " << actor_model << endl;
 
-    if (actor_model.empty()) {
-        cerr << "Didn't specify model file. Exiting." << endl;
-        exit(0);
-    }
+    PPO_Eval model(env, device, actor_model);
 
-    int obs_dim = env.observation_space().shape[0];
-    int act_dim = env.action_space().shape[0];
-
-    FeedForwardNN policy(obs_dim, act_dim, device);
-
-    torch::load(policy, actor_model);
-
-    //eval_policy(policy, env, /*render=*/true);
+    model.eval_policy();
 }
 
 int main(int argc, char* argv[]) {
@@ -1023,14 +1097,13 @@ int main(int argc, char* argv[]) {
         std::cout << "CUDA is NOT available. CPU will be used.\n";
     }
 
-
     try {
-        PendulumEnv env;
-        if (true) {
+        CartPoleEnv env(device);
+        if (false) {
             train(env, hyperparameters, device, "", "");
         }
         else {
-            test(env, device, ""); // only load the actor model
+            eval(env, device, "./models/ppo_actor.pt"); // only load the actor model
         }
     }
     catch (const std::exception& e) {
